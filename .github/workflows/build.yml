@@ -3,6 +3,8 @@ name: Build NiKAudio (Windows + iOS)
 on:
   push:
     branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
   workflow_dispatch:
 
 jobs:
@@ -17,6 +19,12 @@ jobs:
       - name: Compile NiKAudioPC.exe
         run: |
           cl /nologo /O2 /EHsc /std:c++17 /MT /W3 pc\main.cpp /Fe:NiKAudioPC.exe ws2_32.lib iphlpapi.lib ole32.lib uuid.lib winmm.lib avrt.lib
+
+      - name: Verify LAN protocol vectors
+        run: |
+          cl /nologo /O2 /EHsc /std:c++17 /MT /W3 tests\lan_crypto.cpp /Fe:NiKAudioLanTest.exe bcrypt.lib
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\NiKAudioLanTest.exe
 
       - name: Upload Windows EXE
         uses: actions/upload-artifact@v4

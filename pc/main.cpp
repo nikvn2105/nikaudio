@@ -12,6 +12,7 @@
 #include <mmsystem.h>
 #include <avrt.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -23,11 +24,19 @@
 #include <thread>
 #include <vector>
 
+#include "lan_auth.h"
+#include "latency_pulse.h"
+#include "tray.h"
+
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "winmm.lib")
 #pragma comment(lib, "avrt.lib")
+#pragma comment(lib, "bcrypt.lib")
+#pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "user32.lib")
+#pragma comment(lib, "shell32.lib")
 
 static constexpr uint16_t TARGET_PORT = 55123;
 static constexpr uint32_t OUT_SAMPLE_RATE = 48000;
@@ -235,7 +244,7 @@ static SOCKET openUSBTunnelToPhone(uint16_t phonePort) {
 
     BOOL nodelay = TRUE;
     setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char*)&nodelay, sizeof(nodelay));
-    DWORD sendTimeout = 500;
+    DWORD sendTimeout = 15;
     setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&sendTimeout, sizeof(sendTimeout));
     return s;
 }
@@ -244,6 +253,7 @@ static SOCKET openUSBTunnelToPhone(uint16_t phonePort) {
 
 struct LocalIPv4 {
     uint32_t ipHostOrder;
+    uint8_t prefixLength;
 };
 
 static std::vector<LocalIPv4> getActiveLocalIPv4s() {
@@ -275,7 +285,7 @@ static std::vector<LocalIPv4> getActiveLocalIPv4s() {
                              (firstOctet == 192 && secondOctet == 168) ||
                              (firstOctet == 172 && secondOctet >= 16 && secondOctet <= 31);
             if (isPrivate) {
-                results.push_back({ip});
+                results.push_back({ip, u->OnLinkPrefixLength});
             }
         }
     }
@@ -292,8 +302,6 @@ public:
         if (discoverySock_ != INVALID_SOCKET) {
             BOOL bcast = TRUE;
             setsockopt(discoverySock_, SOL_SOCKET, SO_BROADCAST, (const char*)&bcast, sizeof(bcast));
-            DWORD recvTimeout = 60;
-            setsockopt(discoverySock_, SOL_SOCKET, SO_RCVTIMEO, (const char*)&recvTimeout, sizeof(recvTimeout));
             BOOL newBehavior = FALSE;
             DWORD bytesReturned = 0;
             DWORD sioUdpConnReset = _WSAIOW(IOC_VENDOR, 12);
@@ -301,14 +309,14 @@ public:
                      nullptr, 0, &bytesReturned, nullptr, nullptr);
         }
 
-        if (!manualLanIP_.empty()) {
-            setLanTarget(manualLanIP_);
-        }
+        hasPairingKey_ = loadPairingKey(pairingKey_);
         monitorThread_ = std::thread(&DualTransport::monitorLoop, this);
+        heartbeatThread_ = std::thread(&DualTransport::heartbeatLoop, this);
     }
 
     ~DualTransport() {
         running_ = false;
+        if (heartbeatThread_.joinable()) heartbeatThread_.join();
         if (monitorThread_.joinable()) monitorThread_.join();
         std::lock_guard<std::mutex> lk(mu_);
         if (usbSock_ != INVALID_SOCKET) closesocket(usbSock_);
@@ -316,126 +324,239 @@ public:
         if (discoverySock_ != INVALID_SOCKET) closesocket(discoverySock_);
     }
 
-    void sendAudioPacket(uint32_t seq, const int16_t* pcmStereo, size_t frames) {
-        uint8_t pkt[sizeof(AudioPacketHeader) + PACKET_PCM_BYTES];
-        auto* hdr = reinterpret_cast<AudioPacketHeader*>(pkt);
-        std::memcpy(hdr->magic, "NIKA", 4);
-        hdr->seq = seq;
-        hdr->payloadLen = static_cast<uint16_t>(frames * 4);
-        hdr->flags = 0;
-        std::memcpy(pkt + sizeof(AudioPacketHeader), pcmStereo, hdr->payloadLen);
-        int totalLen = static_cast<int>(sizeof(AudioPacketHeader) + hdr->payloadLen);
-
-        std::lock_guard<std::mutex> lk(mu_);
-        if (usbSock_ != INVALID_SOCKET) {
-            if (!sendAll(usbSock_, reinterpret_cast<const char*>(pkt), totalLen)) {
-                closesocket(usbSock_);
-                usbSock_ = INVALID_SOCKET;
-                std::cout << "\n[USB] Mat ket noi cap Lightning -> chuyen tuc thi sang Wi-Fi LAN...\n";
-            } else {
-                return;
-            }
-        }
-
-        if (hasLanTarget_ && udpSock_ != INVALID_SOCKET) {
-            sendto(udpSock_, reinterpret_cast<const char*>(pkt), totalLen, 0,
-                   reinterpret_cast<const sockaddr*>(&lanAddr_), sizeof(lanAddr_));
-        }
+    void setEnabled(bool enabled) {
+        std::lock_guard<std::mutex> lock(mu_);
+        enabled_ = enabled;
     }
+
+    bool pair(const PairingKey& key) {
+        if (!savePairingKey(key)) return false;
+        std::lock_guard<std::mutex> lock(mu_);
+        pairingKey_ = key;
+        hasPairingKey_ = true;
+        hasLanTarget_ = false;
+        ++pairingGeneration_;
+        return true;
+    }
+
+    bool forgetPairing() {
+        if (!CredDeleteW(pairingCredential, CRED_TYPE_GENERIC, 0) && GetLastError() != ERROR_NOT_FOUND) return false;
+        std::lock_guard<std::mutex> lock(mu_);
+        SecureZeroMemory(pairingKey_.data(), pairingKey_.size());
+        hasPairingKey_ = false;
+        hasLanTarget_ = false;
+        ++pairingGeneration_;
+        return true;
+    }
+
+    void sendAudioPacket(const int16_t* pcmStereo, size_t frames) {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (enabled_) sendPacket(pcmStereo, frames);
+    }
+
+    unsigned sequence() const { return seq_; }
 
     std::string statusText() {
         std::lock_guard<std::mutex> lk(mu_);
         if (usbSock_ != INVALID_SOCKET) {
-            if (hasLanTarget_) return "USB Lightning (LAN san sang: " + currentLanIP_ + ")";
+            if (lanReady()) return "USB Lightning (LAN san sang: " + currentLanIP_ + ")";
             return "USB Lightning (usbmuxd)";
         }
-        if (hasLanTarget_) return "Wi-Fi LAN (" + currentLanIP_ + ")";
-        return "Dang tim iPhone (USB / LAN)...";
+        if (lanReady()) return "Wi-Fi LAN (" + currentLanIP_ + ")";
+        return hasPairingKey_ ? "Dang tim iPhone (USB / LAN)..." : "Can ghep doi de dung Wi-Fi LAN";
     }
 
 private:
-    void setLanTarget(const std::string& ip) {
-        std::lock_guard<std::mutex> lk(mu_);
-        lanAddr_ = {};
-        lanAddr_.sin_family = AF_INET;
-        lanAddr_.sin_port = htons(TARGET_PORT);
-        if (inet_pton(AF_INET, ip.c_str(), &lanAddr_.sin_addr) == 1) {
-            hasLanTarget_ = true;
-            currentLanIP_ = ip;
+    using Clock = std::chrono::steady_clock;
+
+    bool lanReady() const {
+        return hasLanTarget_ && Clock::now() - lanConfirmed_ < std::chrono::seconds(12);
+    }
+
+    // Called with mu_ held, so heartbeats and audio share one ordered sequence.
+    void sendPacket(const int16_t* pcm, size_t frames) {
+        std::array<uint8_t, sizeof(AudioPacketHeader) + PACKET_PCM_BYTES> packet{};
+        const bool heartbeat = frames == 0;
+        const AudioPacketHeader header{{'N','I','K','A'}, heartbeat ? ++heartbeatSeq_ : ++seq_,
+                                       static_cast<uint16_t>(frames * 4), static_cast<uint16_t>(heartbeat ? 1 : 0)};
+        std::memcpy(packet.data(), &header, sizeof(header));
+        if (!heartbeat) std::memcpy(packet.data() + sizeof(header), pcm, header.payloadLen);
+        const int length = sizeof(header) + header.payloadLen;
+        lastSent_ = Clock::now();
+
+        if (usbSock_ != INVALID_SOCKET) {
+            if (!sendAll(usbSock_, reinterpret_cast<const char*>(packet.data()), length)) {
+                closesocket(usbSock_);
+                usbSock_ = INVALID_SOCKET;
+                std::cout << "\n[USB] Mat ket noi cap Lightning -> chuyen sang Wi-Fi LAN.\n";
+            } else if (lastSent_ >= usbOverlapUntil_) {
+                return;
+            }
         }
+
+        if (!lanReady() || udpSock_ == INVALID_SOCKET) return;
+        constexpr ULONG prefixSize = sizeof(AudioPacketHeader) + sizeof(LanNonce);
+        std::array<uint8_t, prefixSize + PACKET_PCM_BYTES + sizeof(LanCipherTag)> encrypted{};
+        std::memcpy(encrypted.data(), &header, sizeof(header));
+        std::memcpy(encrypted.data() + sizeof(header), lanNonce_.data(), lanNonce_.size());
+        LanCipherTag tag{};
+        if (!cipher_.encrypt(header.seq, heartbeat, encrypted.data(), prefixSize,
+                             packet.data() + sizeof(header), header.payloadLen,
+                             encrypted.data() + prefixSize, tag)) return;
+        const size_t taggedLength = prefixSize + header.payloadLen;
+        std::memcpy(encrypted.data() + taggedLength, tag.data(), tag.size());
+        sendto(udpSock_, reinterpret_cast<const char*>(encrypted.data()), static_cast<int>(taggedLength + tag.size()),
+               0, reinterpret_cast<const sockaddr*>(&lanAddr_), sizeof(lanAddr_));
     }
 
     void tryDiscoverLAN() {
-        if (!manualLanIP_.empty() || discoverySock_ == INVALID_SOCKET) return;
+        if (discoverySock_ == INVALID_SOCKET) return;
+        PairingKey key{};
+        unsigned generation;
+        sockaddr_in lastTarget{};
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            if (!hasPairingKey_) return;
+            key = pairingKey_;
+            generation = pairingGeneration_;
+            if (lanReady()) lastTarget = lanAddr_;
+        }
+        LanNonce nonce{};
+        if (BCryptGenRandom(nullptr, nonce.data(), static_cast<ULONG>(nonce.size()),
+                            BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) return;
+        char ping[4 + sizeof(LanNonce) + sizeof(LanTag)] = {'N', 'I', 'K', 'D'};
+        std::memcpy(ping + 4, nonce.data(), nonce.size());
+        LanTag tag{};
+        if (!auth_.sign(key, ping, 4 + nonce.size(), tag)) return;
+        std::memcpy(ping + 4 + nonce.size(), tag.data(), tag.size());
+        char replyHeader[4 + sizeof(LanNonce)] = {'N', 'I', 'K', 'R'};
+        std::memcpy(replyHeader + 4, nonce.data(), nonce.size());
 
-        const char ping[4] = {'N', 'I', 'K', 'D'};
-        auto locals = getActiveLocalIPv4s();
+        sockaddr_in manual{};
+        manual.sin_family = AF_INET;
+        manual.sin_port = htons(TARGET_PORT);
+        if (!manualLanIP_.empty()) {
+            if (inet_pton(AF_INET, manualLanIP_.c_str(), &manual.sin_addr) != 1) return;
+            sendto(discoverySock_, ping, sizeof(ping), 0, reinterpret_cast<const sockaddr*>(&manual), sizeof(manual));
+        }
+        if (lastTarget.sin_family == AF_INET && manualLanIP_.empty()) {
+            sendto(discoverySock_, ping, sizeof(ping), 0,
+                   reinterpret_cast<const sockaddr*>(&lastTarget), sizeof(lastTarget));
+        }
+        const auto locals = manualLanIP_.empty() && lastTarget.sin_family != AF_INET
+                            ? getActiveLocalIPv4s() : std::vector<LocalIPv4>{};
 
+        // Probe the directed broadcast and a rolling batch of unicast addresses.
+        // Bounding the batch avoids an ARP storm on large private networks.
         for (const auto& local : locals) {
-            uint32_t subnetBase = local.ipHostOrder & 0xFFFFFF00u;
-            uint8_t myHost = static_cast<uint8_t>(local.ipHostOrder & 0xFFu);
+            const unsigned prefix = local.prefixLength;
+            if (prefix == 0 || prefix >= 32) continue;
+            const uint32_t hostMask = UINT32_MAX >> prefix;
+            const uint32_t subnetBase = local.ipHostOrder & ~hostMask;
             sockaddr_in dst{};
             dst.sin_family = AF_INET;
             dst.sin_port = htons(TARGET_PORT);
-            for (uint32_t host = 1; host <= 254; ++host) {
-                if (host == myHost) continue;
-                dst.sin_addr.s_addr = htonl(subnetBase | host);
-                sendto(discoverySock_, ping, 4, 0, reinterpret_cast<const sockaddr*>(&dst), sizeof(dst));
+            if (prefix < 31) {
+                dst.sin_addr.s_addr = htonl(subnetBase | hostMask);
+                sendto(discoverySock_, ping, sizeof(ping), 0, reinterpret_cast<const sockaddr*>(&dst), sizeof(dst));
+            }
+
+            const uint32_t firstHost = prefix == 31 ? 0 : 1;
+            const uint32_t hostCount = prefix == 31 ? 2 : hostMask - 1;
+            const uint32_t batchSize = std::min(hostCount, 256u);
+            for (uint32_t i = 0; i < batchSize && running_; ++i) {
+                const uint32_t host = firstHost + static_cast<uint32_t>((discoveryOffset_ + i) % hostCount);
+                const uint32_t ip = subnetBase | host;
+                if (ip == local.ipHostOrder) continue;
+                dst.sin_addr.s_addr = htonl(ip);
+                sendto(discoverySock_, ping, sizeof(ping), 0, reinterpret_cast<const sockaddr*>(&dst), sizeof(dst));
             }
         }
+        if (!locals.empty()) discoveryOffset_ += 256;
 
-        auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
-        while (std::chrono::steady_clock::now() < deadline && running_) {
-            char buf[32]{};
+        const auto deadline = Clock::now() + std::chrono::milliseconds(200);
+        while (running_) {
+            const auto remaining = std::chrono::ceil<std::chrono::microseconds>(deadline - Clock::now()).count();
+            if (remaining <= 0) break;
+
+            fd_set readable;
+            FD_ZERO(&readable);
+            FD_SET(discoverySock_, &readable);
+            timeval timeout{0, static_cast<long>(remaining)};
+            if (select(0, &readable, nullptr, nullptr, &timeout) <= 0) break;
+
+            uint8_t buf[4 + 2 * sizeof(LanNonce) + sizeof(LanTag)]{};
             sockaddr_in from{};
             int fromLen = sizeof(from);
-            int n = recvfrom(discoverySock_, buf, sizeof(buf), 0, reinterpret_cast<sockaddr*>(&from), &fromLen);
-            if (n < 0) break;
-            if (n >= 4 && std::memcmp(buf, "NIKR", 4) == 0) {
-                char ipStr[INET_ADDRSTRLEN]{};
-                inet_ntop(AF_INET, &from.sin_addr, ipStr, sizeof(ipStr));
-                std::string foundIP(ipStr);
-                bool changed = false;
-                {
-                    std::lock_guard<std::mutex> lk(mu_);
-                    if (currentLanIP_ != foundIP) changed = true;
-                }
-                setLanTarget(foundIP);
-                if (changed) {
-                    std::cout << "\n[LAN] Tim thay iPhone tai IP: " << foundIP << "\n";
-                }
+            int n = recvfrom(discoverySock_, reinterpret_cast<char*>(buf), sizeof(buf), 0, reinterpret_cast<sockaddr*>(&from), &fromLen);
+            if (n == SOCKET_ERROR) {
+                const int error = WSAGetLastError();
+                if (error == WSAEMSGSIZE || error == WSAECONNRESET) continue;
                 break;
             }
+            if (n != sizeof(buf) || from.sin_port != htons(TARGET_PORT) ||
+                (!manualLanIP_.empty() && from.sin_addr.s_addr != manual.sin_addr.s_addr) ||
+                std::memcmp(buf, replyHeader, sizeof(replyHeader)) != 0) continue;
+            const size_t signedLength = sizeof(replyHeader) + sizeof(LanNonce);
+            LanTag expectedReply{};
+            if (!auth_.sign(key, buf, signedLength, expectedReply) ||
+                !LanAuthenticator::matches(expectedReply, buf + signedLength)) continue;
+
+            char ip[INET_ADDRSTRLEN]{};
+            if (!inet_ntop(AF_INET, &from.sin_addr, ip, sizeof(ip))) continue;
+            std::lock_guard<std::mutex> lock(mu_);
+            if (generation != pairingGeneration_) return;
+            LanNonce sessionNonce{};
+            std::memcpy(sessionNonce.data(), buf + sizeof(replyHeader), sessionNonce.size());
+            LanTag keyMaterial{};
+            if (!auth_.sign(key, sessionNonce.data(), sessionNonce.size(), keyMaterial)) return;
+            const bool cipherReady = cipher_.setSessionKey(keyMaterial);
+            SecureZeroMemory(keyMaterial.data(), keyMaterial.size());
+            if (!cipherReady) return;
+            if (currentLanIP_ != ip) std::cout << "\n[LAN] Ghep doi thanh cong: " << ip << "\n";
+            currentLanIP_ = ip;
+            lanAddr_ = from;
+            lanNonce_ = sessionNonce;
+            lanConfirmed_ = Clock::now();
+            hasLanTarget_ = true;
+            break;
         }
     }
 
     void monitorLoop() {
-        int tick = 0;
         while (running_) {
-            bool needUSB = false;
-            bool hasLan = false;
+            bool needUSB;
+            bool needLANRefresh;
             {
                 std::lock_guard<std::mutex> lk(mu_);
                 needUSB = (usbSock_ == INVALID_SOCKET);
-                hasLan = hasLanTarget_;
+                needLANRefresh = !hasLanTarget_ || Clock::now() - lanConfirmed_ >= std::chrono::seconds(4);
             }
 
-            if (needUSB) {
+            if (needLANRefresh) tryDiscoverLAN();
+
+            if (needUSB && running_) {
                 SOCKET s = openUSBTunnelToPhone(TARGET_PORT);
                 if (s != INVALID_SOCKET) {
                     std::lock_guard<std::mutex> lk(mu_);
                     usbSock_ = s;
+                    usbOverlapUntil_ = Clock::now() + std::chrono::milliseconds(250);
                     std::cout << "\n[USB] Da ket noi iPhone qua cap Lightning!\n";
                 }
             }
 
-            if (!hasLan || (tick % 6 == 0)) {
-                tryDiscoverLAN();
-            }
-
-            tick++;
-            for (int i = 0; i < 15 && running_; ++i) {
+            for (int i = 0; i < 10 && running_; ++i) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+        }
+    }
+
+    void heartbeatLoop() {
+        while (running_) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(80));
+            std::lock_guard<std::mutex> lock(mu_);
+            if (running_ && enabled_ && Clock::now() - lastSent_ >= std::chrono::milliseconds(250)) {
+                sendPacket(nullptr, 0);
             }
         }
     }
@@ -445,11 +566,25 @@ private:
     SOCKET usbSock_{INVALID_SOCKET};
     SOCKET udpSock_{INVALID_SOCKET};
     SOCKET discoverySock_{INVALID_SOCKET};
+    uint64_t discoveryOffset_{0};
     sockaddr_in lanAddr_{};
     bool hasLanTarget_{false};
+    std::atomic<uint32_t> seq_{0};
+    uint32_t heartbeatSeq_{0};
+    bool enabled_{true};
+    LanAuthenticator auth_;
+    LanCipher cipher_;
+    PairingKey pairingKey_{};
+    bool hasPairingKey_{false};
+    unsigned pairingGeneration_{0};
+    LanNonce lanNonce_{};
+    Clock::time_point lanConfirmed_{};
+    Clock::time_point usbOverlapUntil_{};
+    Clock::time_point lastSent_{};
     std::string manualLanIP_;
     std::string currentLanIP_;
     std::thread monitorThread_;
+    std::thread heartbeatThread_;
 };
 
 // MARK: - WASAPI Default Device Change Notifier
@@ -483,6 +618,60 @@ public:
 };
 
 // MARK: - Main: WASAPI Loopback (Auto-Recover) -> 48kHz Stereo Int16 -> DualTransport
+
+struct StereoGain {
+    float left;
+    float right;
+};
+
+static std::vector<StereoGain> stereoGains(unsigned channels, DWORD mask) {
+    if (channels == 1) return {{1.0f, 1.0f}};
+    if (channels == 2) return {{1.0f, 0.0f}, {0.0f, 1.0f}};
+
+    // Extensible PCM orders its channels by ascending speaker bit.
+    unsigned maskChannels = 0;
+    for (DWORD bits = mask; bits != 0; bits &= bits - 1) ++maskChannels;
+    if (maskChannels != channels) {
+        if (channels == 6) mask = KSAUDIO_SPEAKER_5POINT1;
+        else if (channels == 8) mask = KSAUDIO_SPEAKER_7POINT1_SURROUND;
+        else mask = SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT;
+    }
+
+    constexpr float surroundGain = 0.70710678f;
+    std::vector<StereoGain> gains(channels);
+    unsigned channel = 0;
+    float leftSum = 0.0f;
+    float rightSum = 0.0f;
+    for (; mask != 0 && channel < channels; ++channel) {
+        const DWORD speaker = mask & (0u - mask);
+        mask &= mask - 1;
+        auto& gain = gains[channel];
+        switch (speaker) {
+        case SPEAKER_FRONT_LEFT:  gain = {1.0f, 0.0f}; break;
+        case SPEAKER_FRONT_RIGHT: gain = {0.0f, 1.0f}; break;
+        case SPEAKER_BACK_LEFT:
+        case SPEAKER_SIDE_LEFT:
+        case SPEAKER_FRONT_LEFT_OF_CENTER:
+        case SPEAKER_TOP_FRONT_LEFT:
+        case SPEAKER_TOP_BACK_LEFT: gain = {surroundGain, 0.0f}; break;
+        case SPEAKER_BACK_RIGHT:
+        case SPEAKER_SIDE_RIGHT:
+        case SPEAKER_FRONT_RIGHT_OF_CENTER:
+        case SPEAKER_TOP_FRONT_RIGHT:
+        case SPEAKER_TOP_BACK_RIGHT: gain = {0.0f, surroundGain}; break;
+        case SPEAKER_LOW_FREQUENCY: break;
+        default: gain = {surroundGain, surroundGain}; break;
+        }
+        leftSum += gain.left;
+        rightSum += gain.right;
+    }
+    const float peakGain = std::max(1.0f, std::max(leftSum, rightSum));
+    for (auto& gain : gains) {
+        gain.left /= peakGain;
+        gain.right /= peakGain;
+    }
+    return gains;
+}
 
 static inline int16_t floatToInt16(float v) {
     if (v > 1.0f) v = 1.0f;
@@ -525,182 +714,215 @@ int main(int argc, char* argv[]) {
     DWORD taskIndex = 0;
     AvSetMmThreadCharacteristicsW(L"Pro Audio", &taskIndex);
 
-    DualTransport transport(manualIP);
-    uint32_t seq = 0;
-    auto lastLog = std::chrono::steady_clock::now();
+    {
+        DualTransport transport(manualIP);
+        Tray tray([&] { return transport.statusText(); },
+                  [&](const PairingKey& key) { return transport.pair(key); },
+                  [&] { return transport.forgetPairing(); });
+        auto lastLog = std::chrono::steady_clock::now();
 
-    while (true) {
-        notifier.deviceChanged.store(false);
-
-        IMMDevice* device = nullptr;
-        IAudioClient* audioClient = nullptr;
-        IAudioCaptureClient* captureClient = nullptr;
-        WAVEFORMATEX* mixFmt = nullptr;
-
-        auto cleanupSession = [&]() {
-            if (audioClient) { audioClient->Stop(); audioClient->Release(); audioClient = nullptr; }
-            if (captureClient) { captureClient->Release(); captureClient = nullptr; }
-            if (mixFmt) { CoTaskMemFree(mixFmt); mixFmt = nullptr; }
-            if (device) { device->Release(); device = nullptr; }
-        };
-
-        hr = enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device);
-        if (FAILED(hr)) {
-            std::cerr << "\n[WASAPI] Chua tim thay thiet bi phat mac dinh, thu lai sau 1s...\n";
-            cleanupSession();
-            Sleep(1000);
-            continue;
-        }
-
-        hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&audioClient);
-        if (FAILED(hr) || FAILED(audioClient->GetMixFormat(&mixFmt))) {
-            cleanupSession();
-            Sleep(500);
-            continue;
-        }
-
-        bool isFloat = false;
-        if (mixFmt->wFormatTag == WAVE_FORMAT_IEEE_FLOAT) {
-            isFloat = true;
-        } else if (mixFmt->wFormatTag == WAVE_FORMAT_EXTENSIBLE) {
-            auto* ext = reinterpret_cast<WAVEFORMATEXTENSIBLE*>(mixFmt);
-            if (IsEqualGUID(ext->SubFormat, KSDATAFORMAT_SUBTYPE_IEEE_FLOAT)) {
-                isFloat = true;
+        while (!tray.quitting) {
+            transport.setEnabled(tray.enabled);
+            if (!tray.enabled) {
+                Sleep(100);
+                continue;
             }
-        }
+            notifier.deviceChanged.store(false);
 
-        uint32_t inRate = mixFmt->nSamplesPerSec;
-        uint16_t inChannels = mixFmt->nChannels;
-        std::cout << "\n[WASAPI] Bat am thanh he thong: " << inRate << " Hz, "
-                  << inChannels << " kenh, " << (isFloat ? "Float32" : "PCM16") << "\n";
+            IMMDevice* device = nullptr;
+            IAudioClient* audioClient = nullptr;
+            IAudioCaptureClient* captureClient = nullptr;
+            WAVEFORMATEX* mixFmt = nullptr;
 
-        REFERENCE_TIME hnsDuration = 200000;
-        hr = audioClient->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK,
-                                     hnsDuration, 0, mixFmt, nullptr);
-        if (FAILED(hr) || FAILED(audioClient->GetService(__uuidof(IAudioCaptureClient), (void**)&captureClient))) {
-            std::cerr << "[WASAPI] Loi khoi tao Loopback (0x" << std::hex << hr << std::dec << "), thu lai...\n";
-            cleanupSession();
-            Sleep(500);
-            continue;
-        }
+            auto cleanupSession = [&]() {
+                if (audioClient) { audioClient->Stop(); audioClient->Release(); audioClient = nullptr; }
+                if (captureClient) { captureClient->Release(); captureClient = nullptr; }
+                if (mixFmt) { CoTaskMemFree(mixFmt); mixFmt = nullptr; }
+                if (device) { device->Release(); device = nullptr; }
+            };
 
-        hr = audioClient->Start();
-        if (FAILED(hr)) {
-            cleanupSession();
-            Sleep(500);
-            continue;
-        }
-
-        std::vector<int16_t> outQueue;
-        outQueue.reserve(PACKET_FRAMES * 8);
-
-        double resampleStep = static_cast<double>(inRate) / static_cast<double>(OUT_SAMPLE_RATE);
-        double resamplePos = 0.0;
-        float prevL = 0.0f, prevR = 0.0f;
-
-        while (true) {
-            if (notifier.deviceChanged.load()) {
-                std::cout << "\n[WASAPI] Thiet bi phat mac dinh thay doi -> dang khoi tao lai...\n";
-                break;
-            }
-
-            UINT32 packetLength = 0;
-            hr = captureClient->GetNextPacketSize(&packetLength);
+            hr = enumerator->GetDefaultAudioEndpoint(eRender, eConsole, &device);
             if (FAILED(hr)) {
-                std::cout << "\n[WASAPI] Thiet bi phat bi ngat ket noi -> dang khoi tao lai...\n";
-                break;
+                std::cerr << "\n[WASAPI] Chua tim thay thiet bi phat mac dinh, thu lai sau 1s...\n";
+                cleanupSession();
+                Sleep(1000);
+                continue;
             }
 
-            if (packetLength == 0) {
-                Sleep(1);
-            } else {
-                bool needReinit = false;
-                while (packetLength > 0) {
-                    BYTE* data = nullptr;
-                    UINT32 framesAvailable = 0;
-                    DWORD flags = 0;
+            hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&audioClient);
+            if (FAILED(hr) || FAILED(audioClient->GetMixFormat(&mixFmt))) {
+                cleanupSession();
+                Sleep(500);
+                continue;
+            }
 
-                    hr = captureClient->GetBuffer(&data, &framesAvailable, &flags, nullptr, nullptr);
-                    if (FAILED(hr)) {
-                        needReinit = true;
-                        break;
-                    }
+            bool isFloat = false;
+            DWORD channelMask = 0;
+            if (mixFmt->wFormatTag == WAVE_FORMAT_IEEE_FLOAT) {
+                isFloat = true;
+            } else if (mixFmt->wFormatTag == WAVE_FORMAT_EXTENSIBLE) {
+                auto* ext = reinterpret_cast<WAVEFORMATEXTENSIBLE*>(mixFmt);
+                channelMask = ext->dwChannelMask;
+                if (IsEqualGUID(ext->SubFormat, KSDATAFORMAT_SUBTYPE_IEEE_FLOAT)) {
+                    isFloat = true;
+                }
+            }
 
-                    std::vector<float> stereoIn(framesAvailable * 2, 0.0f);
-                    if (!(flags & AUDCLNT_BUFFERFLAGS_SILENT) && data != nullptr) {
-                        if (isFloat) {
-                            const float* f = reinterpret_cast<const float*>(data);
+            const unsigned sampleBytes = mixFmt->wBitsPerSample / 8;
+            const bool isPCM = mixFmt->wFormatTag == WAVE_FORMAT_PCM ||
+                (mixFmt->wFormatTag == WAVE_FORMAT_EXTENSIBLE &&
+                 IsEqualGUID(reinterpret_cast<WAVEFORMATEXTENSIBLE*>(mixFmt)->SubFormat,
+                             KSDATAFORMAT_SUBTYPE_PCM));
+            const uint32_t inRate = mixFmt->nSamplesPerSec;
+            const uint16_t inChannels = mixFmt->nChannels;
+            const unsigned blockAlign = mixFmt->nBlockAlign;
+            if (inChannels == 0 || inRate == 0 || blockAlign != inChannels * sampleBytes ||
+                mixFmt->wBitsPerSample != sampleBytes * 8 ||
+                (isFloat ? sampleBytes != sizeof(float) : !isPCM || sampleBytes < 2 || sampleBytes > 4)) {
+                std::cerr << "[WASAPI] Dinh dang am thanh khong duoc ho tro.\n";
+                cleanupSession();
+                Sleep(1000);
+                continue;
+            }
+            const auto gains = stereoGains(inChannels, channelMask);
+            std::cout << "\n[WASAPI] Bat am thanh he thong: " << inRate << " Hz, "
+                      << inChannels << " kenh, " << (isFloat ? "Float" : "PCM") << mixFmt->wBitsPerSample << "\n";
+
+            REFERENCE_TIME hnsDuration = 200000;
+            hr = audioClient->Initialize(AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK,
+                                         hnsDuration, 0, mixFmt, nullptr);
+            if (FAILED(hr) || FAILED(audioClient->GetService(__uuidof(IAudioCaptureClient), (void**)&captureClient))) {
+                std::cerr << "[WASAPI] Loi khoi tao Loopback (0x" << std::hex << hr << std::dec << "), thu lai...\n";
+                cleanupSession();
+                Sleep(500);
+                continue;
+            }
+
+            hr = audioClient->Start();
+            if (FAILED(hr)) {
+                cleanupSession();
+                Sleep(500);
+                continue;
+            }
+
+            std::vector<int16_t> outQueue;
+            outQueue.reserve(PACKET_FRAMES * 8);
+
+            double resampleStep = static_cast<double>(inRate) / static_cast<double>(OUT_SAMPLE_RATE);
+            double resamplePos = 0.0;
+            float prevL = 0.0f, prevR = 0.0f;
+
+            while (!tray.quitting) {
+                if (!tray.enabled) break;
+                if (notifier.deviceChanged.load()) {
+                    std::cout << "\n[WASAPI] Thiet bi phat mac dinh thay doi -> dang khoi tao lai...\n";
+                    break;
+                }
+
+                UINT32 packetLength = 0;
+                hr = captureClient->GetNextPacketSize(&packetLength);
+                if (FAILED(hr)) {
+                    std::cout << "\n[WASAPI] Thiet bi phat bi ngat ket noi -> dang khoi tao lai...\n";
+                    break;
+                }
+
+                if (packetLength == 0) {
+                    Sleep(1);
+                } else {
+                    bool needReinit = false;
+                    while (packetLength > 0 && tray.enabled && !tray.quitting) {
+                        BYTE* data = nullptr;
+                        UINT32 framesAvailable = 0;
+                        DWORD flags = 0;
+
+                        hr = captureClient->GetBuffer(&data, &framesAvailable, &flags, nullptr, nullptr);
+                        if (FAILED(hr)) {
+                            needReinit = true;
+                            break;
+                        }
+
+                        std::vector<float> stereoIn(framesAvailable * 2, 0.0f);
+                        if (!(flags & AUDCLNT_BUFFERFLAGS_SILENT) && data != nullptr) {
                             for (UINT32 i = 0; i < framesAvailable; ++i) {
-                                float l = f[i * inChannels];
-                                float r = (inChannels >= 2) ? f[i * inChannels + 1] : l;
-                                stereoIn[i * 2] = l;
-                                stereoIn[i * 2 + 1] = r;
+                                float left = 0.0f;
+                                float right = 0.0f;
+                                for (uint16_t channel = 0; channel < inChannels; ++channel) {
+                                    const BYTE* sampleData = data + static_cast<size_t>(i) * blockAlign
+                                                                 + channel * sampleBytes;
+                                    float sample;
+                                    if (isFloat) {
+                                        std::memcpy(&sample, sampleData, sizeof(sample));
+                                    } else {
+                                        // Left-align signed little-endian PCM in a 32-bit sample.
+                                        int32_t pcm = 0;
+                                        std::memcpy(reinterpret_cast<BYTE*>(&pcm) + sizeof(pcm) - sampleBytes,
+                                                    sampleData, sampleBytes);
+                                        sample = static_cast<float>(pcm) / 2147483648.0f;
+                                    }
+                                    left += sample * gains[channel].left;
+                                    right += sample * gains[channel].right;
+                                }
+                                stereoIn[i * 2] = left;
+                                stereoIn[i * 2 + 1] = right;
+                            }
+                        }
+
+                        captureClient->ReleaseBuffer(framesAvailable);
+
+                        if (inRate == OUT_SAMPLE_RATE) {
+                            for (UINT32 i = 0; i < framesAvailable; ++i) {
+                                outQueue.push_back(floatToInt16(stereoIn[i * 2]));
+                                outQueue.push_back(floatToInt16(stereoIn[i * 2 + 1]));
                             }
                         } else {
-                            const int16_t* p = reinterpret_cast<const int16_t*>(data);
-                            for (UINT32 i = 0; i < framesAvailable; ++i) {
-                                float l = p[i * inChannels] / 32768.0f;
-                                float r = (inChannels >= 2) ? (p[i * inChannels + 1] / 32768.0f) : l;
-                                stereoIn[i * 2] = l;
-                                stereoIn[i * 2 + 1] = r;
+                            while (resamplePos < static_cast<double>(framesAvailable)) {
+                                int idx = static_cast<int>(resamplePos);
+                                float frac = static_cast<float>(resamplePos - idx);
+                                float l0 = (idx == 0) ? prevL : stereoIn[(idx - 1) * 2];
+                                float r0 = (idx == 0) ? prevR : stereoIn[(idx - 1) * 2 + 1];
+                                float l1 = stereoIn[idx * 2];
+                                float r1 = stereoIn[idx * 2 + 1];
+                                outQueue.push_back(floatToInt16(l0 + (l1 - l0) * frac));
+                                outQueue.push_back(floatToInt16(r0 + (r1 - r0) * frac));
+                                resamplePos += resampleStep;
+                            }
+                            resamplePos -= static_cast<double>(framesAvailable);
+                            if (framesAvailable > 0) {
+                                prevL = stereoIn[(framesAvailable - 1) * 2];
+                                prevR = stereoIn[(framesAvailable - 1) * 2 + 1];
                             }
                         }
-                    }
 
-                    captureClient->ReleaseBuffer(framesAvailable);
+                        size_t offset = 0;
+                        while (outQueue.size() - offset >= PACKET_FRAMES * 2) {
+                            transport.sendAudioPacket(outQueue.data() + offset, PACKET_FRAMES);
+                            offset += PACKET_FRAMES * 2;
+                        }
+                        if (offset > 0) {
+                            outQueue.erase(outQueue.begin(), outQueue.begin() + offset);
+                        }
 
-                    if (inRate == OUT_SAMPLE_RATE) {
-                        for (UINT32 i = 0; i < framesAvailable; ++i) {
-                            outQueue.push_back(floatToInt16(stereoIn[i * 2]));
-                            outQueue.push_back(floatToInt16(stereoIn[i * 2 + 1]));
-                        }
-                    } else {
-                        while (resamplePos < static_cast<double>(framesAvailable)) {
-                            int idx = static_cast<int>(resamplePos);
-                            float frac = static_cast<float>(resamplePos - idx);
-                            float l0 = (idx == 0) ? prevL : stereoIn[(idx - 1) * 2];
-                            float r0 = (idx == 0) ? prevR : stereoIn[(idx - 1) * 2 + 1];
-                            float l1 = stereoIn[idx * 2];
-                            float r1 = stereoIn[idx * 2 + 1];
-                            outQueue.push_back(floatToInt16(l0 + (l1 - l0) * frac));
-                            outQueue.push_back(floatToInt16(r0 + (r1 - r0) * frac));
-                            resamplePos += resampleStep;
-                        }
-                        resamplePos -= static_cast<double>(framesAvailable);
-                        if (framesAvailable > 0) {
-                            prevL = stereoIn[(framesAvailable - 1) * 2];
-                            prevR = stereoIn[(framesAvailable - 1) * 2 + 1];
+                        hr = captureClient->GetNextPacketSize(&packetLength);
+                        if (FAILED(hr)) {
+                            needReinit = true;
+                            break;
                         }
                     }
-
-                    size_t offset = 0;
-                    while (outQueue.size() - offset >= PACKET_FRAMES * 2) {
-                        transport.sendAudioPacket(++seq, outQueue.data() + offset, PACKET_FRAMES);
-                        offset += PACKET_FRAMES * 2;
-                    }
-                    if (offset > 0) {
-                        outQueue.erase(outQueue.begin(), outQueue.begin() + offset);
-                    }
-
-                    hr = captureClient->GetNextPacketSize(&packetLength);
-                    if (FAILED(hr)) {
-                        needReinit = true;
-                        break;
-                    }
+                    if (needReinit) break;
                 }
-                if (needReinit) break;
+
+                auto now = std::chrono::steady_clock::now();
+                if (std::chrono::duration_cast<std::chrono::seconds>(now - lastLog).count() >= 2) {
+                    std::cout << "\rTrang thai: " << transport.statusText()
+                              << " | Goi da gui: " << transport.sequence() << "        " << std::flush;
+                    lastLog = now;
+                }
             }
 
-            auto now = std::chrono::steady_clock::now();
-            if (std::chrono::duration_cast<std::chrono::seconds>(now - lastLog).count() >= 2) {
-                std::cout << "\rTrang thai: " << transport.statusText()
-                          << " | Goi da gui: " << seq << "        " << std::flush;
-                lastLog = now;
-            }
+            cleanupSession();
+            Sleep(200);
         }
 
-        cleanupSession();
-        Sleep(200);
     }
 
     enumerator->UnregisterEndpointNotificationCallback(&notifier);
