@@ -267,26 +267,27 @@ private struct GlassBackdrop: View {
         GeometryReader { proxy in
             ZStack {
                 Color.black
-                band(GlassTheme.mint, size: proxy.size, offset: -0.28, alignment: .topLeading)
-                band(GlassTheme.lilac, size: proxy.size, offset: 0.24, alignment: .bottomTrailing)
+                band(GlassTheme.mint, width: proxy.size.width)
+                    .position(x: proxy.size.width * 0.20, y: proxy.size.height * 0.18)
+                band(GlassTheme.lilac, width: proxy.size.width)
+                    .position(x: proxy.size.width * 0.80, y: proxy.size.height * 0.83)
             }
+            .clipped()
         }
         .ignoresSafeArea()
         .accessibilityHidden(true)
         .allowsHitTesting(false)
     }
 
-    private func band(_ color: Color, size: CGSize, offset: CGFloat, alignment: Alignment) -> some View {
+    private func band(_ color: Color, width: CGFloat) -> some View {
         Capsule()
             .fill(
                 LinearGradient(colors: [.clear, color.opacity(0.28), color.opacity(0.13), .clear],
                                startPoint: .leading, endPoint: .trailing)
             )
-            .frame(width: max(size.width * 1.9, 500), height: 142)
+            .frame(width: max(width * 1.9, 500), height: 142)
             .rotationEffect(.degrees(-29))
             .blur(radius: 55)
-            .offset(x: size.width * offset)
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: alignment)
     }
 }
 
