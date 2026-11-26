@@ -13,8 +13,8 @@ final class AudioRingBuffer {
     private var availableFrames: Int = 0
     private let lock: UnsafeMutablePointer<os_unfair_lock>
 
-    private var targetFrames: Int = 720 // 15ms @ 48kHz
-    private var maxFrames: Int = 2400   // 50ms ceiling before trimming drift
+    private var targetFrames: Int = 960  // 20ms @ 48kHz
+    private var maxFrames: Int = 2880    // 60ms ceiling before trimming drift
     private var primed: Bool = false
 
     private var lastL: Float = 0
@@ -35,9 +35,9 @@ final class AudioRingBuffer {
 
     func setTargetMs(_ ms: Double) {
         os_unfair_lock_lock(lock)
-        let clamped = max(5.0, min(60.0, ms))
+        let clamped = max(10.0, min(60.0, ms))
         targetFrames = Int((clamped / 1000.0) * 48000.0)
-        maxFrames = max(targetFrames * 2 + 480, 1920)
+        maxFrames = max(targetFrames * 2 + 480, 2400)
         os_unfair_lock_unlock(lock)
     }
 
@@ -164,7 +164,7 @@ final class AudioReceiver: NSObject, ObservableObject {
     @Published var bufferMs: Double = 0
     @Published var packetsPerSec: Int = 0
     @Published var droppedPackets: Int = 0
-    @Published var targetBufferMs: Double = 15.0 {
+    @Published var targetBufferMs: Double = 20.0 {
         didSet { ringBuffer.setTargetMs(targetBufferMs) }
     }
     @Published var statusMessage: String = "Nhấn Bắt đầu để lắng nghe âm thanh từ PC"
@@ -174,15 +174,18 @@ final class AudioReceiver: NSObject, ObservableObject {
 
     private var engine: AVAudioEngine?
     private var sourceNode: AVAudioSourceNode?
+    private var telemetryTimer: Timer?
+
     private var udpListener: NWListener?
     private var tcpListener: NWListener?
     private var activeTCPConnections: [NWConnection] = []
     private var activeUDPConnections: [NWConnection] = []
-    private var telemetryTimer: Timer?
-
     private var lastUSBTime: CFAbsoluteTime = 0
     private var lastLANTime: CFAbsoluteTime = 0
+    private var lastPacketTime: CFAbsoluteTime = 0
+    private var lastTransportIsUSB: Bool = false
     private var packetCounter: Int = 0
+    private var droppedCounter: Int = 0
     private var lastSeq: UInt32 = 0
     private var hasSeq: Bool = false
 
@@ -202,6 +205,12 @@ final class AudioReceiver: NSObject, ObservableObject {
             name: AVAudioSession.interruptionNotification,
             object: nil
         )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleEngineConfigChange),
+            name: .AVAudioEngineConfigurationChange,
+            object: nil
+        )
     }
 
     deinit {
@@ -217,14 +226,22 @@ final class AudioReceiver: NSObject, ObservableObject {
         guard !isRunning else { return }
         ringBuffer.setTargetMs(targetBufferMs)
         ringBuffer.reset()
-        hasSeq = false
-        droppedPackets = 0
-        packetCounter = 0
+
+        netQueue.async { [weak self] in
+            guard let self = self else { return }
+            self.hasSeq = false
+            self.droppedCounter = 0
+            self.packetCounter = 0
+            self.lastUSBTime = 0
+            self.lastLANTime = 0
+            self.lastPacketTime = 0
+        }
 
         do {
             try setupAudioSessionAndEngine()
             try startListeners()
             isRunning = true
+            droppedPackets = 0
             statusMessage = "Đang chờ kết nối USB hoặc Wi-Fi trên cổng \(Self.port)"
             updateLocalIP()
             updateOutputRoute()
@@ -239,15 +256,20 @@ final class AudioReceiver: NSObject, ObservableObject {
         telemetryTimer?.invalidate()
         telemetryTimer = nil
 
-        udpListener?.cancel()
-        udpListener = nil
-        tcpListener?.cancel()
-        tcpListener = nil
+        netQueue.async { [weak self] in
+            guard let self = self else { return }
+            self.udpListener?.cancel()
+            self.udpListener = nil
+            self.tcpListener?.cancel()
+            self.tcpListener = nil
 
-        for conn in activeTCPConnections { conn.cancel() }
-        activeTCPConnections.removeAll()
-        for conn in activeUDPConnections { conn.cancel() }
-        activeUDPConnections.removeAll()
+            for conn in self.activeTCPConnections { conn.cancel() }
+            self.activeTCPConnections.removeAll()
+            for conn in self.activeUDPConnections { conn.cancel() }
+            self.activeUDPConnections.removeAll()
+            self.packetCounter = 0
+            self.hasSeq = false
+        }
 
         engine?.stop()
         engine = nil
@@ -264,13 +286,17 @@ final class AudioReceiver: NSObject, ObservableObject {
     }
 
     private func setupAudioSessionAndEngine() throws {
+        engine?.stop()
+        engine = nil
+        sourceNode = nil
+
         let session = AVAudioSession.sharedInstance()
         try session.setCategory(.playback, mode: .default, options: [])
         try session.setPreferredSampleRate(48000.0)
         try session.setPreferredIOBufferDuration(0.005)
         try session.setActive(true)
 
-        let engine = AVAudioEngine()
+        let newEngine = AVAudioEngine()
         guard let format = AVAudioFormat(standardFormatWithSampleRate: 48000.0, channels: 2) else {
             throw NSError(domain: "NiKAudio", code: -1, userInfo: [NSLocalizedDescriptionKey: "Không tạo được AudioFormat 48kHz"])
         }
@@ -290,13 +316,25 @@ final class AudioReceiver: NSObject, ObservableObject {
             return noErr
         }
 
-        engine.attach(src)
-        engine.connect(src, to: engine.mainMixerNode, format: format)
-        engine.prepare()
-        try engine.start()
+        newEngine.attach(src)
+        newEngine.connect(src, to: newEngine.mainMixerNode, format: format)
+        newEngine.prepare()
+        try newEngine.start()
 
-        self.engine = engine
+        self.engine = newEngine
         self.sourceNode = src
+    }
+
+    private func restartAudioEngineIfNeeded() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self, self.isRunning else { return }
+            do {
+                try self.setupAudioSessionAndEngine()
+                self.updateOutputRoute()
+            } catch {
+                self.statusMessage = "Lỗi khởi động lại âm thanh: \(error.localizedDescription)"
+            }
+        }
     }
 
     private func startListeners() throws {
@@ -310,8 +348,6 @@ final class AudioReceiver: NSObject, ObservableObject {
         tcp.newConnectionHandler = { [weak self] conn in
             self?.handleTCPConnection(conn)
         }
-        tcp.start(queue: netQueue)
-        self.tcpListener = tcp
 
         let udpParams = NWParameters.udp
         udpParams.allowLocalEndpointReuse = true
@@ -320,18 +356,25 @@ final class AudioReceiver: NSObject, ObservableObject {
         udp.newConnectionHandler = { [weak self] conn in
             self?.handleUDPConnection(conn)
         }
-        udp.start(queue: netQueue)
-        self.udpListener = udp
+
+        netQueue.async { [weak self] in
+            guard let self = self else { return }
+            self.tcpListener = tcp
+            self.udpListener = udp
+            tcp.start(queue: self.netQueue)
+            udp.start(queue: self.netQueue)
+        }
     }
 
     private func handleTCPConnection(_ conn: NWConnection) {
         activeTCPConnections.append(conn)
         conn.stateUpdateHandler = { [weak self] state in
-            if case .failed = state {
-                conn.cancel()
-                self?.activeTCPConnections.removeAll { $0 === conn }
-            } else if case .cancelled = state {
-                self?.activeTCPConnections.removeAll { $0 === conn }
+            guard let self = self else { return }
+            switch state {
+            case .failed, .cancelled:
+                self.activeTCPConnections.removeAll { $0 === conn }
+            default:
+                break
             }
         }
         conn.start(queue: netQueue)
@@ -348,6 +391,7 @@ final class AudioReceiver: NSObject, ObservableObject {
             }
             if isComplete || error != nil {
                 conn.cancel()
+                self.activeTCPConnections.removeAll { $0 === conn }
                 return
             }
             self.receiveTCPChunk(conn: conn, accumulator: acc)
@@ -383,6 +427,15 @@ final class AudioReceiver: NSObject, ObservableObject {
             activeUDPConnections.removeFirst()
         }
         activeUDPConnections.append(conn)
+        conn.stateUpdateHandler = { [weak self] state in
+            guard let self = self else { return }
+            switch state {
+            case .failed, .cancelled:
+                self.activeUDPConnections.removeAll { $0 === conn }
+            default:
+                break
+            }
+        }
         conn.start(queue: netQueue)
         receiveUDPMessage(conn: conn)
     }
@@ -413,6 +466,7 @@ final class AudioReceiver: NSObject, ObservableObject {
                 self.receiveUDPMessage(conn: conn)
             } else {
                 conn.cancel()
+                self.activeUDPConnections.removeAll { $0 === conn }
             }
         }
     }
@@ -426,14 +480,27 @@ final class AudioReceiver: NSObject, ObservableObject {
             lastLANTime = now
         }
 
-        if hasSeq && seq > lastSeq + 1 {
-            let diff = Int(seq - lastSeq - 1)
-            if diff < 1000 {
-                DispatchQueue.main.async { self.droppedPackets += diff }
-            }
+        if !hasSeq || isUSB != lastTransportIsUSB || (now - lastPacketTime) > 1.0 {
+            lastSeq = seq
+            hasSeq = true
+            lastTransportIsUSB = isUSB
+            lastPacketTime = now
+            packetCounter += 1
+            ringBuffer.pushPCM16(payload)
+            return
         }
+
+        let delta = Int32(bitPattern: seq &- lastSeq)
+        if !isUSB && delta <= 0 {
+            return
+        }
+        if delta > 1 && delta < 1000 {
+            droppedCounter += Int(delta - 1)
+        }
+
         lastSeq = seq
-        hasSeq = true
+        lastTransportIsUSB = isUSB
+        lastPacketTime = now
         packetCounter += 1
         ringBuffer.pushPCM16(payload)
     }
@@ -442,23 +509,27 @@ final class AudioReceiver: NSObject, ObservableObject {
         telemetryTimer?.invalidate()
         telemetryTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
             guard let self = self else { return }
-            let now = CFAbsoluteTimeGetCurrent()
-            let currentMode: TransportMode
-            if now - self.lastUSBTime < 1.0 {
-                currentMode = .usb
-            } else if now - self.lastLANTime < 1.0 {
-                currentMode = .lan
-            } else {
-                currentMode = .waiting
-            }
-            let pps = self.packetCounter * 2
-            self.packetCounter = 0
-            let bufMs = self.ringBuffer.bufferedMs()
+            self.netQueue.async {
+                let now = CFAbsoluteTimeGetCurrent()
+                let currentMode: TransportMode
+                if now - self.lastUSBTime < 1.0 {
+                    currentMode = .usb
+                } else if now - self.lastLANTime < 1.0 {
+                    currentMode = .lan
+                } else {
+                    currentMode = .waiting
+                }
+                let pps = self.packetCounter * 2
+                self.packetCounter = 0
+                let dropped = self.droppedCounter
+                let bufMs = self.ringBuffer.bufferedMs()
 
-            DispatchQueue.main.async {
-                self.mode = currentMode
-                self.packetsPerSec = pps
-                self.bufferMs = bufMs
+                DispatchQueue.main.async {
+                    self.mode = currentMode
+                    self.packetsPerSec = pps
+                    self.droppedPackets = dropped
+                    self.bufferMs = bufMs
+                }
             }
         }
     }
@@ -467,13 +538,16 @@ final class AudioReceiver: NSObject, ObservableObject {
         updateOutputRoute()
     }
 
+    @objc private func handleEngineConfigChange() {
+        restartAudioEngineIfNeeded()
+    }
+
     @objc private func handleInterruption(_ notification: Notification) {
         guard let info = notification.userInfo,
               let typeVal = info[AVAudioSessionInterruptionTypeKey] as? UInt,
               let type = AVAudioSession.InterruptionType(rawValue: typeVal) else { return }
-        if type == .ended, isRunning {
-            try? AVAudioSession.sharedInstance().setActive(true)
-            try? engine?.start()
+        if type == .ended {
+            restartAudioEngineIfNeeded()
         }
     }
 
@@ -592,8 +666,8 @@ struct ContentView: View {
                                 .font(.subheadline.monospaced())
                                 .foregroundColor(.cyan)
                         }
-                        Slider(value: $receiver.targetBufferMs, in: 5...40, step: 1)
-                        Text("10–15ms là mức mượt nhất cho tai nghe TWS; 5–8ms cho tai nghe dây.")
+                        Slider(value: $receiver.targetBufferMs, in: 10...60, step: 1)
+                        Text("20ms là mức ổn định mặc định cho WASAPI + TWS; kéo xuống 12–15ms nếu mạng thật sạch.")
                             .font(.caption)
                             .foregroundColor(.secondary)
                     }
