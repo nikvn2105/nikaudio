@@ -16,7 +16,7 @@ jobs:
 
       - name: Compile NiKAudioPC.exe
         run: |
-          cl /nologo /O2 /EHsc /std:c++17 /MT /W3 pc\main.cpp /Fe:NiKAudioPC.exe ws2_32.lib ole32.lib uuid.lib winmm.lib avrt.lib
+          cl /nologo /O2 /EHsc /std:c++17 /MT /W3 pc\main.cpp /Fe:NiKAudioPC.exe ws2_32.lib iphlpapi.lib ole32.lib uuid.lib winmm.lib avrt.lib
 
       - name: Upload Windows EXE
         uses: actions/upload-artifact@v4
