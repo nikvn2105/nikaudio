@@ -1,0 +1,63 @@
+name: Build NiKAudio (Windows + iOS)
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Compile NiKAudioPC.exe
+        run: |
+          cl /nologo /O2 /EHsc /std:c++17 /MT /W3 pc\main.cpp /Fe:NiKAudioPC.exe ws2_32.lib ole32.lib uuid.lib winmm.lib avrt.lib
+
+      - name: Upload Windows EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: NiKAudio-Windows
+          path: NiKAudioPC.exe
+
+  build-ios:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode Project
+        working-directory: ios
+        run: xcodegen generate
+
+      - name: Build Unsigned iOS App
+        working-directory: ios
+        run: |
+          xcodebuild \
+            -project NiKAudio.xcodeproj \
+            -scheme NiKAudio \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_IDENTITY="" \
+            build
+
+      - name: Package Unsigned IPA
+        run: |
+          mkdir -p dist/Payload
+          cp -r ios/build/Build/Products/Release-iphoneos/NiKAudio.app dist/Payload/
+          cd dist && zip -r ../NiKAudio.ipa Payload
+
+      - name: Upload iOS IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: NiKAudio-iOS-IPA
+          path: NiKAudio.ipa
