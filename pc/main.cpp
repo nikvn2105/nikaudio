@@ -37,6 +37,9 @@
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "gdiplus.lib")
+#pragma comment(lib, "gdi32.lib")
+#pragma comment(lib, "dwmapi.lib")
 
 static constexpr uint16_t TARGET_PORT = 55123;
 static constexpr uint32_t OUT_SAMPLE_RATE = 48000;
@@ -355,6 +358,13 @@ public:
     }
 
     unsigned sequence() const { return seq_; }
+
+    std::wstring windowStatus() {
+        std::lock_guard<std::mutex> lock(mu_);
+        if (usbSock_ != INVALID_SOCKET) return L"Đang gửi qua Lightning";
+        if (lanReady()) return L"Đang gửi qua Wi-Fi";
+        return hasPairingKey_ ? L"Đang tìm iPhone" : L"Đang chờ iPhone";
+    }
 
     std::string statusText() {
         std::lock_guard<std::mutex> lk(mu_);
@@ -714,9 +724,10 @@ int main(int argc, char* argv[]) {
     DWORD taskIndex = 0;
     AvSetMmThreadCharacteristicsW(L"Pro Audio", &taskIndex);
 
+    SetProcessDPIAware();
     {
         DualTransport transport(manualIP);
-        Tray tray([&] { return transport.statusText(); },
+        Tray tray([&] { return transport.windowStatus(); },
                   [&](const PairingKey& key) { return transport.pair(key); },
                   [&] { return transport.forgetPairing(); });
         auto lastLog = std::chrono::steady_clock::now();
