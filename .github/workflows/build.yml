@@ -18,7 +18,9 @@ jobs:
 
       - name: Compile NiKAudioPC.exe
         run: |
-          cl /nologo /O2 /EHsc /std:c++17 /MT /W3 /utf-8 pc\main.cpp /Fe:NiKAudioPC.exe ws2_32.lib iphlpapi.lib ole32.lib uuid.lib winmm.lib avrt.lib
+          rc /nologo /I . /fo NiKAudioFonts.res pc\fonts.rc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cl /nologo /O2 /EHsc /std:c++17 /MT /W3 /utf-8 pc\main.cpp NiKAudioFonts.res /Fe:NiKAudioPC.exe ws2_32.lib iphlpapi.lib ole32.lib uuid.lib winmm.lib avrt.lib
 
       - name: Verify LAN protocol vectors
         run: |

@@ -57,13 +57,13 @@ private:
         case WM_DRAWITEM: {
             const auto* item = reinterpret_cast<const DRAWITEMSTRUCT*>(lParam);
             if (item && item->CtlType == ODT_BUTTON) {
-                GlassWindow::button(*item, tray->scale_, item->CtlID == toggle);
+                GlassWindow::button(*item, *tray->fonts_, tray->scale_, item->CtlID == toggle);
                 return TRUE;
             }
             break;
         }
         case WM_PAINT:
-            GlassWindow::paint(window, tray->scale_, tray->visibleStatus_, !tray->enabled);
+            GlassWindow::paint(window, *tray->fonts_, tray->scale_, tray->visibleStatus_, !tray->enabled);
             return 0;
         case WM_ERASEBKGND:
             return TRUE;
@@ -99,7 +99,12 @@ private:
         Gdiplus::GdiplusStartupInput input;
         ULONG_PTR graphicsToken = 0;
         if (Gdiplus::GdiplusStartup(&graphicsToken, &input, nullptr) != Gdiplus::Ok) return;
-        runWindow();
+        {
+            GlassWindow::Fonts fonts;
+            fonts_ = &fonts;
+            runWindow();
+            fonts_ = nullptr;
+        }
         Gdiplus::GdiplusShutdown(graphicsToken);
     }
 
@@ -284,6 +289,7 @@ private:
     bool ownsConsole_{false};
     bool iconVisible_{false};
     float scale_{1.0f};
+    const GlassWindow::Fonts* fonts_{nullptr};
     std::wstring visibleStatus_;
     std::atomic<HWND> window_{nullptr};
     std::atomic<bool> closing_{false};

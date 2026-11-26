@@ -3,6 +3,8 @@
 #include <gdiplus.h>
 #include <iterator>
 
+#include "font_resources.h"
+
 namespace GlassWindow {
 constexpr int width = 560;
 constexpr int height = 400;
@@ -41,14 +43,39 @@ inline void band(Gdiplus::Graphics& graphics, float x, float y, Gdiplus::Color t
     graphics.Restore(state);
 }
 
-inline void text(Gdiplus::Graphics& graphics, const std::wstring& value, Gdiplus::RectF bounds,
+class Fonts {
+public:
+    Fonts() {
+        if (!add(IDR_FONT_REGULAR) || !add(IDR_FONT_BOLD)) return;
+        int found = 0;
+        available_ = collection_.GetFamilies(1, &family_, &found) == Gdiplus::Ok && found == 1;
+    }
+
+    const Gdiplus::FontFamily* family() const {
+        if (available_) return &family_;
+        return Gdiplus::FontFamily::GenericSansSerif();
+    }
+
+private:
+    bool add(unsigned id) {
+        const HMODULE module = GetModuleHandleW(nullptr);
+        const HRSRC resource = FindResourceW(module, MAKEINTRESOURCEW(id), MAKEINTRESOURCEW(10));
+        if (!resource) return false;
+        const HGLOBAL bytes = LoadResource(module, resource);
+        const void* data = bytes ? LockResource(bytes) : nullptr;
+        const DWORD size = SizeofResource(module, resource);
+        return data && size &&
+               collection_.AddMemoryFont(data, static_cast<int>(size)) == Gdiplus::Ok;
+    }
+
+    Gdiplus::PrivateFontCollection collection_;
+    Gdiplus::FontFamily family_;
+    bool available_{false};
+};
+
+inline void text(Gdiplus::Graphics& graphics, const Fonts& fonts, const std::wstring& value, Gdiplus::RectF bounds,
                  float size, Gdiplus::Color color, bool bold = false, bool centered = false) {
-    Gdiplus::FontFamily preferred(L"Segoe UI");
-    Gdiplus::FontFamily fallback(L"Arial");
-    const auto* family = preferred.GetLastStatus() == Gdiplus::Ok ? &preferred
-                       : fallback.GetLastStatus() == Gdiplus::Ok ? &fallback
-                       : Gdiplus::FontFamily::GenericSansSerif();
-    Gdiplus::Font font(family, size, bold ? Gdiplus::FontStyleBold : Gdiplus::FontStyleRegular,
+    Gdiplus::Font font(fonts.family(), size, bold ? Gdiplus::FontStyleBold : Gdiplus::FontStyleRegular,
                        Gdiplus::UnitPixel);
     Gdiplus::StringFormat format;
     format.SetTrimming(Gdiplus::StringTrimmingEllipsisCharacter);
@@ -81,7 +108,7 @@ inline void backdrop(Gdiplus::Graphics& graphics, bool contrast) {
     }
 }
 
-inline void paint(HWND window, float scale, const std::wstring& status, bool paused) {
+inline void paint(HWND window, const Fonts& fonts, float scale, const std::wstring& status, bool paused) {
     PAINTSTRUCT paint{};
     HDC target = BeginPaint(window, &paint);
     RECT bounds{};
@@ -108,11 +135,11 @@ inline void paint(HWND window, float scale, const std::wstring& status, bool pau
 
         backdrop(graphics, contrast);
 
-        text(graphics, L"NiKAudio", RectF(27, 21, 500, 49), 35, foreground, true);
+        text(graphics, fonts, L"NiKAudio", RectF(27, 21, 500, 49), 35, foreground, true);
         SolidBrush dot(paused || contrast ? secondary : mint);
         graphics.FillEllipse(&dot, 46.0f, 124.0f, 8.0f, 8.0f);
-        text(graphics, L"Âm thanh từ PC", RectF(64, 116, 440, 25), 15, secondary);
-        text(graphics, status, RectF(46, 144, 466, 35), 25, foreground, true);
+        text(graphics, fonts, L"Âm thanh từ PC", RectF(64, 116, 440, 25), 15, secondary);
+        text(graphics, fonts, status, RectF(46, 144, 466, 35), 25, foreground, true);
     }
     if (buffered) {
         BitBlt(target, 0, 0, bounds.right, bounds.bottom, buffer, 0, 0, SRCCOPY);
@@ -123,7 +150,7 @@ inline void paint(HWND window, float scale, const std::wstring& status, bool pau
     EndPaint(window, &paint);
 }
 
-inline void button(const DRAWITEMSTRUCT& item, float scale, bool primary) {
+inline void button(const DRAWITEMSTRUCT& item, const Fonts& fonts, float scale, bool primary) {
     using namespace Gdiplus;
     const bool contrast = highContrast();
     const bool disabled = (item.itemState & ODS_DISABLED) != 0;
@@ -160,6 +187,6 @@ inline void button(const DRAWITEMSTRUCT& item, float scale, bool primary) {
         pen.SetDashStyle(DashStyleDot);
         graphics.DrawPath(&pen, &focus);
     }
-    text(graphics, caption, RectF(8, 0, w - 16, h), primary ? 16.0f : 14.0f, ink, primary, true);
+    text(graphics, fonts, caption, RectF(8, 0, w - 16, h), primary ? 16.0f : 14.0f, ink, primary, true);
 }
 }

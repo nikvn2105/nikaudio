@@ -32,7 +32,7 @@ struct ContentView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 Text("NiKAudio")
-                    .font(.largeTitle.weight(.semibold))
+                    .font(AppFont.bold(34, relativeTo: .largeTitle))
                     .accessibilityAddTraits(.isHeader)
                     .padding(.vertical, 8)
                 playbackCard
@@ -43,7 +43,7 @@ struct ContentView: View {
                 } label: {
                     HStack(spacing: 12) {
                         Label("Ghép đôi Wi-Fi", systemImage: "link")
-                            .font(.headline)
+                            .font(AppFont.bold(17, relativeTo: .headline))
                         Spacer()
                         Image(systemName: "chevron.forward")
                             .font(.footnote.weight(.semibold))
@@ -62,6 +62,7 @@ struct ContentView: View {
             .frame(maxWidth: .infinity)
         }
         .background(GlassBackdrop())
+        .font(AppFont.regular(17, relativeTo: .body))
         .sheet(isPresented: $showPairing, onDismiss: { pairingKey = "" }) {
             pairingSheet
         }
@@ -78,15 +79,15 @@ struct ContentView: View {
 
             VStack(alignment: .leading, spacing: 6) {
                 Text(status.title)
-                    .font(.title2.weight(.semibold))
+                    .font(AppFont.bold(22, relativeTo: .title2))
                     .accessibilityAddTraits(.isHeader)
                 if let statusDetail = statusDetail {
                     Text(statusDetail)
-                        .font(.subheadline)
+                        .font(AppFont.regular(15, relativeTo: .subheadline))
                         .foregroundStyle(.secondary)
                 }
                 Label(receiver.outputRoute, systemImage: "headphones")
-                    .font(.subheadline)
+                    .font(AppFont.regular(15, relativeTo: .subheadline))
                     .foregroundStyle(.secondary)
                     .accessibilityLabel("Đầu ra âm thanh: \(receiver.outputRoute)")
             }
@@ -96,7 +97,7 @@ struct ContentView: View {
             } label: {
                 Label(receiver.isRunning ? "Dừng nhận âm thanh" : "Bắt đầu nhận âm thanh",
                       systemImage: receiver.isRunning ? "stop.fill" : "play.fill")
-                    .font(.headline)
+                    .font(AppFont.bold(17, relativeTo: .headline))
                     .frame(maxWidth: .infinity)
                     .padding(.vertical, 15)
                     .padding(.horizontal, 12)
@@ -114,7 +115,7 @@ struct ContentView: View {
     private var qualityCard: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Chất lượng phát")
-                .font(.headline)
+                .font(AppFont.bold(17, relativeTo: .headline))
                 .accessibilityAddTraits(.isHeader)
             ViewThatFits(in: .horizontal) {
                 HStack(spacing: 8) {
@@ -137,7 +138,7 @@ struct ContentView: View {
             receiver.targetBufferMs = milliseconds
         } label: {
             Label(title, systemImage: symbol)
-                .font(.subheadline.weight(.semibold))
+                .font(AppFont.bold(15, relativeTo: .subheadline))
                 .fixedSize(horizontal: true, vertical: false)
                 .frame(maxWidth: .infinity, minHeight: 44)
                 .padding(.horizontal, 10)
@@ -174,7 +175,7 @@ struct ContentView: View {
             .padding(.top, 16)
         } label: {
             Label("Chẩn đoán", systemImage: "waveform.path")
-                .font(.headline)
+                .font(AppFont.bold(17, relativeTo: .headline))
                 .frame(minHeight: 28)
         }
         .tint(GlassTheme.mint)
@@ -191,9 +192,9 @@ struct ContentView: View {
                         .foregroundStyle(.secondary)
                     if !pairingKey.isEmpty {
                         VStack(alignment: .leading, spacing: 12) {
-                            Text("Khóa ghép đôi").font(.headline)
+                            Text("Khóa ghép đôi").font(AppFont.bold(17, relativeTo: .headline))
                             Text(pairingKey)
-                                .font(.body.monospaced())
+                                .font(AppFont.regular(17, relativeTo: .body))
                                 .textSelection(.enabled)
                         }
                         .padding(18)
@@ -211,12 +212,18 @@ struct ContentView: View {
                 .frame(maxWidth: .infinity)
             }
             .background(GlassBackdrop())
-            .navigationTitle("Ghép đôi Wi-Fi")
+            .font(AppFont.regular(17, relativeTo: .body))
             .navigationBarTitleDisplayMode(.inline)
             .toolbarBackground(.hidden, for: .navigationBar)
             .toolbar {
+                ToolbarItem(placement: .principal) {
+                    Text("Ghép đôi Wi-Fi")
+                        .font(AppFont.bold(17, relativeTo: .headline))
+                        .accessibilityAddTraits(.isHeader)
+                }
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Xong") { showPairing = false }
+                        .font(AppFont.bold(17, relativeTo: .headline))
                         .tint(GlassTheme.mint)
                 }
             }
@@ -252,8 +259,18 @@ struct ContentView: View {
                 Text(value).monospacedDigit()
             }
         }
-        .font(.subheadline)
+        .font(AppFont.regular(15, relativeTo: .subheadline))
         .accessibilityElement(children: .combine)
+    }
+}
+
+private enum AppFont {
+    static func regular(_ size: CGFloat, relativeTo style: Font.TextStyle) -> Font {
+        .custom("BeVietnamPro-Regular", size: size, relativeTo: style)
+    }
+
+    static func bold(_ size: CGFloat, relativeTo style: Font.TextStyle) -> Font {
+        .custom("BeVietnamPro-Bold", size: size, relativeTo: style)
     }
 }
 

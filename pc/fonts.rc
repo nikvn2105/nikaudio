@@ -1,0 +1,5 @@
+#include "font_resources.h"
+
+IDR_FONT_REGULAR RCDATA "assets/fonts/BeVietnamPro-Regular.ttf"
+IDR_FONT_BOLD RCDATA "assets/fonts/BeVietnamPro-Bold.ttf"
+IDR_FONT_LICENSE RCDATA "assets/fonts/OFL.txt"

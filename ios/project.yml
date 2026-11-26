@@ -9,6 +9,8 @@ targets:
     platform: iOS
     sources:
       - path: Sources
+      - path: ../assets/fonts
+        buildPhase: resources
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.nikvn2105.nikaudio
@@ -24,6 +26,9 @@ targets:
         CFBundleDisplayName: NiKAudio
         CFBundleShortVersionString: "1.0.0"
         CFBundleVersion: "1"
+        UIAppFonts:
+          - BeVietnamPro-Regular.ttf
+          - BeVietnamPro-Bold.ttf
         UIBackgroundModes:
           - audio
         NSLocalNetworkUsageDescription: "NiKAudio can truy cap mang noi bo de nhan am thanh tu PC."

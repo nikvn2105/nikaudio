@@ -24,3 +24,7 @@ Bản Windows và iOS có ghép đôi phải được cập nhật cùng nhau đ
 2. Tắt nhạc và hiệu ứng âm thanh khác, bắt đầu ghi rồi chọn **Đo độ trễ** trong cửa sổ, hoặc **Play latency test pulses** trong khay. NiKAudio phát 20 xung qua thiết bị phát Windows mặc định, mỗi xung cách nhau hai giây.
 3. Xuất file stereo PCM 16-bit WAV và chạy `python3 tools/measure_latency.py recording.wav`. Lưu số cặp khớp, median và p95. Đo lại qua USB và Wi‑Fi, lần lượt với đầu ra có dây và TWS. Chênh lệch giữa hai phép đo cùng đường truyền là ước tính phần độ trễ tăng thêm của đường phát TWS.
 4. Chạy thêm một phiên nghe 30 phút khi khóa màn hình. Cắm/rút Lightning nhiều lần, ngắt/nối TWS, đổi thiết bị phát mặc định trên Windows và thử sleep/resume. Ghi số lần hụt và khoảng cách gói, rồi nghe lại bản ghi để đối chiếu với lúc mất tiếng thực tế.
+
+## Phông chữ
+
+Giao diện Windows và iPhone dùng chung Be Vietnam Pro, được nhúng trong ứng dụng theo giấy phép [SIL Open Font License](assets/fonts/OFL.txt).
