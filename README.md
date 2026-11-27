@@ -37,3 +37,9 @@ Giao diện Windows và iPhone dùng chung Be Vietnam Pro, được nhúng trong
 4. Nếu bị gián đoạn, chọn lại đúng tệp hoặc bấm tải lại. Đầu nhận tiếp tục từ dữ liệu đã lưu và kiểm tra SHA-256 toàn tệp trước khi công bố bản hoàn chỉnh.
 
 Tệp đi qua kết nối TCP riêng dùng AES-256-GCM với khóa phiên theo từng hướng, xác thực từ khóa ghép đôi. Một lượt truyền hoạt động tại một thời điểm. Không cần bật nhận âm thanh để chép tệp.
+
+## Kiểm tra khả năng sideload ReplayKit
+
+Nhánh kiểm tra đóng gói Broadcast Upload Extension và dùng App Group `group.com.nikvn2105.nikaudio`. Công cụ sideload phải ký cả ứng dụng lẫn extension và giữ cùng App Group trên hai target. Nếu công cụ đổi bundle ID, giá trị `preferredExtension` và cấu hình App Group phải khớp với bundle đã ký.
+
+Sau khi cài bản kiểm tra, mở tab **Màn hình** và bật hệ thống phát màn hình. Kết quả mong đợi là **Đã nhận khung hình từ ReplayKit**. Dừng phát từ Trung tâm điều khiển sau khi thấy kết quả. Bản kiểm tra chỉ xác nhận callback khung hình, bỏ dữ liệu ảnh và cả hai loại mẫu âm thanh. Bản này chưa chiếu sang Windows.
