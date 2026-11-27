@@ -253,6 +253,24 @@ static SOCKET openUSBTunnelToPhone(uint16_t phonePort) {
     return s;
 }
 
+static bool readUSBPairingKey(PairingKey& key) {
+    const SOCKET socket = openUSBTunnelToPhone(TARGET_PORT);
+    if (socket == INVALID_SOCKET) return false;
+
+    constexpr char request[] = {'N', 'I', 'K', 'P', 1, 0, 0, 0};
+    constexpr char expected[] = {'N', 'I', 'K', 'Q', 1, 0, 32, 0};
+    char response[sizeof(expected) + 32]{};
+    const bool read = sendAll(socket, request, sizeof(request)) &&
+                      recvAll(socket, response, sizeof(response)) &&
+                      std::memcmp(response, expected, sizeof(expected)) == 0;
+    char extra = 0;
+    const bool exact = read && recv(socket, &extra, 1, 0) == 0;
+    if (exact) std::memcpy(key.data(), response + sizeof(expected), key.size());
+    SecureZeroMemory(response, sizeof(response));
+    closesocket(socket);
+    return exact;
+}
+
 // MARK: - Local IPv4 Subnet Enumeration for Unicast LAN Discovery
 
 struct LocalIPv4 {
@@ -364,7 +382,7 @@ public:
         std::lock_guard<std::mutex> lock(mu_);
         if (usbSock_ != INVALID_SOCKET) return L"Đang gửi qua Lightning";
         if (lanReady()) return L"Đang gửi qua Wi-Fi";
-        return hasPairingKey_ ? L"Đang tìm iPhone" : L"Đang chờ iPhone";
+        return hasPairingKey_ ? L"Đang tìm iPhone" : L"Cần ghép đôi để dùng Wi-Fi";
     }
 
     std::string statusText() {
@@ -670,7 +688,7 @@ int main(int argc, char* argv[]) {
         DualTransport transport(manualIP);
         Tray tray([&] { return transport.windowStatus(); },
                   [&](const PairingKey& key) { return transport.pair(key); },
-                  [&] { return transport.forgetPairing(); });
+                  [&] { return transport.forgetPairing(); }, readUSBPairingKey);
         auto lastLog = std::chrono::steady_clock::now();
 
         while (!tray.quitting) {

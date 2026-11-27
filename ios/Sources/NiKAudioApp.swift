@@ -28,6 +28,7 @@ final class AudioReceiver: NSObject, ObservableObject {
     @Published private(set) var lastHandoffMs: Double?
     @Published private(set) var pcIdle = false
     @Published private(set) var needsAudioRecovery = false
+    @Published private(set) var usbPairingMessage: String?
     @Published var targetBufferMs: Double = 20.0 {
         didSet { ringBuffer.setTargetMs(targetBufferMs) }
     }
@@ -44,6 +45,7 @@ final class AudioReceiver: NSObject, ObservableObject {
     private var audioInterrupted = false
     private var lanKey: SymmetricKey?
     private var lanSessions = LANSessionTable()
+    private var usbKeyOffer: (token: UUID, key: Data, expiry: TimeInterval)?
 
     private var udpListener: NWListener?
     private var tcpListener: NWListener?
@@ -153,6 +155,7 @@ final class AudioReceiver: NSObject, ObservableObject {
     }
 
     func stop(message: String = "Đã dừng") {
+        cancelUSBPairing()
         let sessionWasOpen = listenerSession != nil
         listenerSession = nil
         restartWork?.cancel()
@@ -245,6 +248,65 @@ final class AudioReceiver: NSObject, ObservableObject {
             if renew { self?.lanSessions.clear() }
         }
         return key.map { String(format: "%02x", $0) }.joined()
+    }
+
+    func allowUSBPairing() {
+        guard isRunning else { return }
+        do {
+            let key = try LANPairing.key()
+            let token = UUID()
+            usbPairingMessage = "Trong 30 giây, bấm Ghép đôi qua USB trên PC."
+            netQueue.async { [weak self] in
+                self?.usbKeyOffer = (token, key, ProcessInfo.processInfo.systemUptime + 30)
+            }
+            netQueue.asyncAfter(deadline: .now() + 30) { [weak self] in
+                guard let self = self, self.usbKeyOffer?.token == token else { return }
+                self.usbKeyOffer = nil
+                DispatchQueue.main.async { self.usbPairingMessage = "Đã hết thời gian gửi khóa." }
+            }
+        } catch {
+            usbPairingMessage = error.localizedDescription
+        }
+    }
+
+    func cancelUSBPairing() {
+        usbPairingMessage = nil
+        netQueue.async { [weak self] in self?.usbKeyOffer = nil }
+    }
+
+    private func isLoopback(_ endpoint: NWEndpoint) -> Bool {
+        guard case .hostPort(let host, _) = endpoint else { return false }
+        switch host {
+        case .ipv4(let address):
+            return address.rawValue.first == 127
+        case .ipv6(let address):
+            return address == IPv6Address("::1")
+        default:
+            return false
+        }
+    }
+
+    private func replyToUSBPairing(_ request: Data, connection: NWConnection) {
+        guard request == Data([78, 73, 75, 80, 1, 0, 0, 0]), isLoopback(connection.endpoint),
+              let offer = usbKeyOffer, ProcessInfo.processInfo.systemUptime < offer.expiry,
+              offer.key.count == 32 else {
+            connection.cancel()
+            return
+        }
+        usbKeyOffer = nil
+        let header = Data([78, 73, 75, 81, 1, 0, 32, 0]) // NIKQ, version 1, 32-byte key
+        connection.send(content: header + offer.key, contentContext: .finalMessage, isComplete: true,
+                        completion: .contentProcessed { [weak self] error in
+            if error != nil {
+                connection.cancel()
+            } else {
+                self?.netQueue.asyncAfter(deadline: .now() + 3) { connection.cancel() }
+            }
+            DispatchQueue.main.async {
+                self?.usbPairingMessage = error == nil
+                    ? "Đã gửi khóa. Xác nhận lưu trên Windows." : "Không gửi được khóa. Hãy thử lại."
+            }
+        })
     }
 
     func recoverAudio() {
@@ -355,6 +417,7 @@ final class AudioReceiver: NSObject, ObservableObject {
 
     private final class TCPStream {
         var buffer = Data()
+        var identifiedAsAudio = false
     }
 
     private func receiveTCPChunk(conn: NWConnection, stream: TCPStream) {
@@ -362,6 +425,24 @@ final class AudioReceiver: NSObject, ObservableObject {
             guard let self = self else { return }
             if let data = data, !data.isEmpty {
                 stream.buffer.append(data)
+                if !stream.identifiedAsAudio {
+                    if stream.buffer.count < 4 {
+                        if isComplete || error != nil { conn.cancel() }
+                        else { self.receiveTCPChunk(conn: conn, stream: stream) }
+                        return
+                    }
+                    if stream.buffer.prefix(4) == Data("NIKP".utf8) {
+                        if stream.buffer.count >= 8 {
+                            self.replyToUSBPairing(stream.buffer, connection: conn)
+                        } else if isComplete || error != nil {
+                            conn.cancel()
+                        } else {
+                            self.receiveTCPChunk(conn: conn, stream: stream)
+                        }
+                        return
+                    }
+                    stream.identifiedAsAudio = true
+                }
                 self.parseTCPStream(&stream.buffer)
             }
             if isComplete || error != nil {
