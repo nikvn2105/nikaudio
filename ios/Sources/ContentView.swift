@@ -138,6 +138,11 @@ struct ContentView: View {
                     preset("Ổn định", symbol: "shield", milliseconds: 30)
                 }
             }
+            if receiver.isRunning && receiver.effectiveTargetMs > 0 {
+                Text("Mức đệm đang áp dụng: \(milliseconds(receiver.effectiveTargetMs))")
+                    .font(AppFont.regular(13, relativeTo: .footnote))
+                    .foregroundStyle(.secondary)
+            }
         }
         .padding(18)
         .glassPanel(radius: 24)
