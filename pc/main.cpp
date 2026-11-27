@@ -262,15 +262,15 @@ static bool readUSBPairingKey(PairingKey& key) {
     constexpr char request[] = {'N', 'I', 'K', 'P', 1, 0, 0, 0};
     constexpr char expected[] = {'N', 'I', 'K', 'Q', 1, 0, 32, 0};
     char response[sizeof(expected) + 32]{};
-    const bool read = sendAll(socket, request, sizeof(request)) &&
-                      recvAll(socket, response, sizeof(response)) &&
-                      std::memcmp(response, expected, sizeof(expected)) == 0;
-    char extra = 0;
-    const bool exact = read && recv(socket, &extra, 1, 0) == 0;
-    if (exact) std::memcpy(key.data(), response + sizeof(expected), key.size());
+    const bool received = sendAll(socket, request, sizeof(request)) &&
+                          recvAll(socket, response, sizeof(response)) &&
+                          std::memcmp(response, expected, sizeof(expected)) == 0 &&
+                          std::any_of(response + sizeof(expected), response + sizeof(response),
+                                      [](char byte) { return byte != 0; });
+    if (received) std::memcpy(key.data(), response + sizeof(expected), key.size());
     SecureZeroMemory(response, sizeof(response));
     closesocket(socket);
-    return exact;
+    return received;
 }
 
 // MARK: - Local IPv4 Subnet Enumeration for Unicast LAN Discovery
