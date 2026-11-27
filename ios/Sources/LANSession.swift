@@ -12,7 +12,8 @@ struct LANSession {
     func decrypt(_ packet: Data, prefixSize: Int, payloadLength: Int, flags: UInt16) -> Data? {
         var iv = Data(count: 12)
         iv.replaceSubrange(0..<4, with: packet.dropFirst(4).prefix(4))
-        iv[4] = UInt8(flags)
+        // Audio flags stay in the authenticated header; only heartbeat uses the other IV domain.
+        iv[4] = flags == 1 ? 1 : 0
         do {
             let gcmNonce = try AES.GCM.Nonce(data: iv)
             let box = try AES.GCM.SealedBox(nonce: gcmNonce,

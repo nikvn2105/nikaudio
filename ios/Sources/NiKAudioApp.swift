@@ -471,7 +471,7 @@ final class AudioReceiver: NSObject, ObservableObject {
                 if buffer.count < totalLen { return }
                 let payload = buffer.subdata(in: (buffer.startIndex + 12)..<(buffer.startIndex + totalLen))
                 buffer.removeFirst(totalLen)
-                self.ingestPacket(seq: seq, payload: payload, isUSB: true)
+                self.ingestPacket(seq: seq, payload: payload, isUSB: true, captureResumed: flags == 2)
             } else {
                 buffer.removeFirst(1)
             }
@@ -511,7 +511,7 @@ final class AudioReceiver: NSObject, ObservableObject {
     }
 
     private func isValidPacket(payloadLen: Int, flags: UInt16) -> Bool {
-        (flags == 0 && payloadLen == 480) || (flags == 1 && payloadLen == 0)
+        ((flags == 0 || flags == 2) && payloadLen == 480) || (flags == 1 && payloadLen == 0)
     }
 
     private func handleLANDatagram(_ data: Data, connection: NWConnection) {
@@ -553,12 +553,12 @@ final class AudioReceiver: NSObject, ObservableObject {
         guard let payload = session.decrypt(data, prefixSize: prefixSize, payloadLength: payloadLen,
                                             flags: flags) else { return }
         guard session.accept(seq: seq, heartbeat: flags == 1) else {
-            if flags == 0 { recordLatePacket(seq: seq) }
+            if flags != 1 { recordLatePacket(seq: seq) }
             return
         }
-        lanSessions.update(session, audio: flags == 0)
+        lanSessions.update(session, audio: flags != 1)
         authenticatedAudioConnection = connection
-        ingestPacket(seq: seq, payload: payload, isUSB: false)
+        ingestPacket(seq: seq, payload: payload, isUSB: false, captureResumed: flags == 2)
     }
 
     private func recordLatePacket(seq: UInt32) {
@@ -569,7 +569,7 @@ final class AudioReceiver: NSObject, ObservableObject {
         }
     }
 
-    private func ingestPacket(seq: UInt32, payload: Data, isUSB: Bool) {
+    private func ingestPacket(seq: UInt32, payload: Data, isUSB: Bool, captureResumed: Bool) {
         let now = ProcessInfo.processInfo.systemUptime
         if payload.isEmpty {
             ringBuffer.markSenderIdle()
@@ -600,7 +600,7 @@ final class AudioReceiver: NSObject, ObservableObject {
         lastContactTime = now
         lastContactIsUSB = isUSB
         packetCounter += 1
-        ringBuffer.pushPCM16(payload, isUSB: isUSB)
+        ringBuffer.pushPCM16(payload, isUSB: isUSB, captureResumed: captureResumed)
     }
 
     private func startTelemetry() {

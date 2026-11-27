@@ -46,6 +46,8 @@ static constexpr uint16_t TARGET_PORT = 55123;
 static constexpr uint32_t OUT_SAMPLE_RATE = 48000;
 static constexpr size_t PACKET_FRAMES = 120; // 2.5ms @ 48kHz
 static constexpr size_t PACKET_PCM_BYTES = PACKET_FRAMES * 4; // Stereo Int16
+static constexpr uint16_t FLAG_HEARTBEAT = 1;
+static constexpr uint16_t FLAG_CAPTURE_RESUMED = 2;
 
 #pragma pack(push, 1)
 struct AudioPacketHeader {
@@ -371,9 +373,9 @@ public:
         return true;
     }
 
-    void sendAudioPacket(const int16_t* pcmStereo, size_t frames) {
+    void sendAudioPacket(const int16_t* pcmStereo, size_t frames, bool captureResumed) {
         std::lock_guard<std::mutex> lock(mu_);
-        if (enabled_) sendPacket(pcmStereo, frames);
+        if (enabled_) sendPacket(pcmStereo, frames, captureResumed);
     }
 
     unsigned sequence() const { return seq_; }
@@ -403,11 +405,12 @@ private:
     }
 
     // Called with mu_ held, so heartbeats and audio share one ordered sequence.
-    void sendPacket(const int16_t* pcm, size_t frames) {
+    void sendPacket(const int16_t* pcm, size_t frames, bool captureResumed = false) {
         std::array<uint8_t, sizeof(AudioPacketHeader) + PACKET_PCM_BYTES> packet{};
         const bool heartbeat = frames == 0;
+        const uint16_t flags = heartbeat ? FLAG_HEARTBEAT : (captureResumed ? FLAG_CAPTURE_RESUMED : 0);
         const AudioPacketHeader header{{'N','I','K','A'}, heartbeat ? ++heartbeatSeq_ : ++seq_,
-                                       static_cast<uint16_t>(frames * 4), static_cast<uint16_t>(heartbeat ? 1 : 0)};
+                                       static_cast<uint16_t>(frames * 4), flags};
         std::memcpy(packet.data(), &header, sizeof(header));
         if (!heartbeat) std::memcpy(packet.data() + sizeof(header), pcm, header.payloadLen);
         const int length = sizeof(header) + header.payloadLen;
@@ -783,6 +786,8 @@ int main(int argc, char* argv[]) {
             double resamplePos = 0.0;
             float prevL = 0.0f, prevR = 0.0f;
             bool prevSurround = false;
+            auto lastCapture = std::chrono::steady_clock::time_point{};
+            bool markCaptureResumed = true;
 
             while (!tray.quitting) {
                 if (!tray.enabled) break;
@@ -811,6 +816,22 @@ int main(int argc, char* argv[]) {
                         if (FAILED(hr)) {
                             needReinit = true;
                             break;
+                        }
+
+                        const auto capturedAt = std::chrono::steady_clock::now();
+                        if (framesAvailable > 0) {
+                            // Normal loopback bursts can be spaced around 10 ms. Flag a sender-side gap
+                            // independently of network timing or the 250 ms heartbeat cadence.
+                            constexpr auto captureGap = std::chrono::milliseconds(40);
+                            if (capturedAt - lastCapture >= captureGap ||
+                                (flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY)) {
+                                markCaptureResumed = true;
+                                outQueue.clear();
+                                resamplePos = 0.0;
+                                prevL = prevR = 0.0f;
+                                prevSurround = false;
+                            }
+                            lastCapture = capturedAt;
                         }
 
                         std::vector<float> stereoIn(framesAvailable * 2, 0.0f);
@@ -876,7 +897,8 @@ int main(int argc, char* argv[]) {
 
                         size_t offset = 0;
                         while (outQueue.size() - offset >= PACKET_FRAMES * 2) {
-                            transport.sendAudioPacket(outQueue.data() + offset, PACKET_FRAMES);
+                            transport.sendAudioPacket(outQueue.data() + offset, PACKET_FRAMES, markCaptureResumed);
+                            markCaptureResumed = false;
                             offset += PACKET_FRAMES * 2;
                         }
                         if (offset > 0) {

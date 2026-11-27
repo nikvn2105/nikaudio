@@ -37,6 +37,44 @@ struct AudioCoreTests {
         check(ring.diagnostics().targetMs == 20, "USB did not reset the LAN buffer boost")
     }
 
+    static func testShortCapturePauses() {
+        let ring = AudioRingBuffer()
+        let output = UnsafeMutablePointer<Float>.allocate(capacity: 240)
+        defer { output.deallocate() }
+        for _ in 0..<12 { ring.pushPCM16(packet, isUSB: false) }
+        for _ in 0..<6 {
+            // 100 ms without capture or heartbeat, then the first resumed PCM frame.
+            for _ in 0..<20 { ring.pull(left: output, right: nil, frameCount: 240) }
+            ring.pushPCM16(packet, isUSB: false, captureResumed: true)
+            for _ in 0..<11 { ring.pushPCM16(packet, isUSB: false) }
+        }
+        let idle = ring.diagnostics()
+        check(idle.underruns == 0 && idle.targetMs == 20, "Short PC pauses inflated the LAN buffer")
+        for _ in 0..<20 { ring.pull(left: output, right: nil, frameCount: 240) }
+        ring.pushPCM16(packet, isUSB: false)
+        check(ring.diagnostics().underruns == 1 && ring.diagnostics().targetMs == 25,
+              "Unmarked network stall was not counted")
+    }
+
+    static func testAuthenticatedResumeMarker() {
+        let key = SymmetricKey(data: Data(repeating: 3, count: 32))
+        let session = LANSession(challenge: Data(), nonce: Data(), expiresAt: 25,
+                                 key: key, lastAudioSeq: nil, lastHeartbeatSeq: nil)
+        var header = Data(count: 28)
+        header[4] = 42
+        header[10] = 2
+        var iv = Data(count: 12)
+        iv[0] = 42
+        let sealed = try! AES.GCM.seal(packet, using: key, nonce: AES.GCM.Nonce(data: iv), authenticating: header)
+        check(session.decrypt(header + sealed.ciphertext + sealed.tag, prefixSize: 28,
+                              payloadLength: packet.count, flags: 2) == packet,
+              "Resume marker did not use the audio nonce domain")
+        header[10] = 0
+        check(session.decrypt(header + sealed.ciphertext + sealed.tag, prefixSize: 28,
+                              payloadLength: packet.count, flags: 0) == nil,
+              "Resume marker was not authenticated")
+    }
+
     static func testSessions() {
         var table = LANSessionTable()
         let key = SymmetricKey(data: Data(repeating: 1, count: 32))
@@ -79,6 +117,8 @@ struct AudioCoreTests {
 
     static func main() {
         testUnderruns()
+        testShortCapturePauses()
+        testAuthenticatedResumeMarker()
         testSessions()
         testDrift(ppm: -200)
         testDrift(ppm: 200)

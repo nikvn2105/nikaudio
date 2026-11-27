@@ -119,7 +119,7 @@ final class AudioRingBuffer {
         lastR = 0
     }
 
-    func pushPCM16(_ data: Data, isUSB: Bool) {
+    func pushPCM16(_ data: Data, isUSB: Bool, captureResumed: Bool = false) {
         let frameCount = data.count / 4
         if frameCount <= 0 { return }
 
@@ -127,9 +127,11 @@ final class AudioRingBuffer {
         defer { os_unfair_lock_unlock(lock) }
 
         if pendingUnderrun {
-            underruns += 1
-            if !lastAudioWasUSB && !isUSB {
-                adaptiveFrames = min(1440, adaptiveFrames + 240)
+            if !captureResumed {
+                underruns += 1
+                if !lastAudioWasUSB && !isUSB {
+                    adaptiveFrames = min(1440, adaptiveFrames + 240)
+                }
             }
             pendingUnderrun = false
             stableTime = 0
