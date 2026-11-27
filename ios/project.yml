@@ -9,17 +9,8 @@ targets:
     platform: iOS
     sources:
       - path: Sources
-      - path: SharedScreen
       - path: ../assets/fonts
         buildPhase: resources
-    dependencies:
-      - target: NiKAudioScreenBroadcast
-        embed: true
-    entitlements:
-      path: NiKAudio.entitlements
-      properties:
-        com.apple.security.application-groups:
-          - group.com.nikvn2105.nikaudio
     settings:
       base:
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
@@ -47,31 +38,3 @@ targets:
         UILaunchScreen: {}
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
-  NiKAudioScreenBroadcast:
-    type: app-extension
-    platform: iOS
-    sources:
-      - path: ScreenBroadcast
-      - path: SharedScreen
-    settings:
-      base:
-        APPLICATION_EXTENSION_API_ONLY: YES
-        PRODUCT_BUNDLE_IDENTIFIER: com.nikvn2105.nikaudio.screen-broadcast
-        MARKETING_VERSION: "1.0.0"
-        CURRENT_PROJECT_VERSION: "1"
-        SWIFT_VERSION: "5.0"
-        CODE_SIGNING_ALLOWED: NO
-        CODE_SIGNING_REQUIRED: NO
-    entitlements:
-      path: ScreenBroadcast/NiKAudioScreenBroadcast.entitlements
-      properties:
-        com.apple.security.application-groups:
-          - group.com.nikvn2105.nikaudio
-    info:
-      path: ScreenBroadcast/Info.plist
-      properties:
-        CFBundleDisplayName: NiKAudio
-        NSExtension:
-          NSExtensionPointIdentifier: com.apple.broadcast-services-upload
-          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).SampleHandler
-          RPBroadcastProcessMode: RPBroadcastProcessModeSampleBuffer
