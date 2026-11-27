@@ -3,10 +3,12 @@ import AVKit
 import UIKit
 
 struct ContentView: View {
+    @Environment(\.scenePhase) private var scenePhase
     @StateObject private var receiver = AudioReceiver()
     @State private var showPairing = false
     @State private var showDiagnostics = false
     @State private var confirmKeyRenewal = false
+    @State private var confirmUSBPairing = false
     @State private var pairingKey = ""
     @State private var pairingError = ""
 
@@ -23,10 +25,11 @@ struct ContentView: View {
     }
 
     private var statusDetail: String? {
-        if receiver.isRunning && receiver.pcIdle { return receiver.mode.rawValue }
         if receiver.statusMessage.hasPrefix("Lỗi") || receiver.statusMessage.hasPrefix("Đang chờ mở cổng") {
             return receiver.statusMessage
         }
+        if receiver.needsAudioRecovery { return "Phát âm thanh đang bị gián đoạn." }
+        if receiver.isRunning && receiver.pcIdle { return receiver.mode.rawValue }
         return nil
     }
 
@@ -65,7 +68,10 @@ struct ContentView: View {
         }
         .background(GlassBackdrop())
         .font(AppFont.regular(17, relativeTo: .body))
-        .sheet(isPresented: $showPairing, onDismiss: { pairingKey = "" }) {
+        .onChange(of: scenePhase) { phase in
+            if phase == .active { receiver.recoverAudioIfNeeded() }
+        }
+        .sheet(isPresented: $showPairing, onDismiss: { pairingKey = ""; receiver.cancelUSBPairing() }) {
             pairingSheet
         }
     }
@@ -105,6 +111,11 @@ struct ContentView: View {
                                 in: RoundedRectangle(cornerRadius: 18))
             }
             .buttonStyle(.plain)
+            if receiver.needsAudioRecovery {
+                Button("Khôi phục âm thanh") { receiver.recoverAudio() }
+                    .buttonStyle(.bordered)
+                    .tint(GlassTheme.mint)
+            }
         }
         .padding(20)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -125,6 +136,11 @@ struct ContentView: View {
                     preset("Độ trễ thấp", symbol: "bolt", milliseconds: 12)
                     preset("Ổn định", symbol: "shield", milliseconds: 30)
                 }
+            }
+            if receiver.isRunning && receiver.effectiveTargetMs > 0 {
+                Text("Mức đệm đang áp dụng: \(milliseconds(receiver.effectiveTargetMs))")
+                    .font(AppFont.regular(13, relativeTo: .footnote))
+                    .foregroundStyle(.secondary)
             }
         }
         .padding(18)
@@ -187,8 +203,23 @@ struct ContentView: View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
-                    Text("Chuyển khóa sang máy tính qua kênh riêng. Trên Windows, chép khóa vào clipboard rồi chọn **Pair using key from clipboard** trong khay NiKAudio.")
+                    Text("Dùng cáp USB hoặc chép khóa sang PC qua kênh riêng. Trên Windows, chọn **Ghép đôi từ clipboard** trong cửa sổ hoặc **Pair using key from clipboard** trong khay NiKAudio.")
                         .foregroundStyle(.secondary)
+                    Button("Gửi khóa qua cáp") { confirmUSBPairing = true }
+                        .buttonStyle(.borderedProminent)
+                        .tint(GlassTheme.mint)
+                        .foregroundStyle(.black)
+                        .disabled(!receiver.isRunning)
+                        .confirmationDialog("Chỉ gửi khóa khi iPhone đang cắm cáp vào PC của bạn.",
+                                            isPresented: $confirmUSBPairing, titleVisibility: .visible) {
+                            Button("Cho phép gửi một lần") { receiver.allowUSBPairing() }
+                        }
+                    if !receiver.isRunning {
+                        Text("Bật nhận âm thanh để ghép đôi qua cáp.").foregroundStyle(.secondary)
+                    }
+                    if let message = receiver.usbPairingMessage {
+                        Text(message).foregroundStyle(.secondary)
+                    }
                     if !pairingKey.isEmpty {
                         VStack(alignment: .leading, spacing: 12) {
                             Text("Khóa ghép đôi").font(AppFont.bold(17, relativeTo: .headline))
@@ -228,7 +259,10 @@ struct ContentView: View {
             }
             .confirmationDialog("Khóa cũ trên Windows sẽ mất hiệu lực.", isPresented: $confirmKeyRenewal,
                                 titleVisibility: .visible) {
-                Button("Tạo khóa mới", role: .destructive) { loadPairing(renew: true) }
+                Button("Tạo khóa mới", role: .destructive) {
+                        receiver.cancelUSBPairing()
+                        loadPairing(renew: true)
+                    }
             }
         }
     }
