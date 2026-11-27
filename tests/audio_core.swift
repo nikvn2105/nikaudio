@@ -56,9 +56,32 @@ struct AudioCoreTests {
         check(table.lookup(Data([1]), now: 26) == nil, "Expired active session bypassed expiration")
     }
 
+    static func testDrift(ppm: Double) {
+        let ring = AudioRingBuffer()
+        let output = UnsafeMutablePointer<Float>.allocate(capacity: 240)
+        defer { output.deallocate() }
+        for _ in 0..<8 { ring.pushPCM16(packet, isUSB: false) }
+        let interval = 120 / (1 + ppm / 1_000_000)
+        var arrival = interval + 37
+        for frame in stride(from: 0, to: 48_000 * 60 * 30, by: 240) {
+            while arrival <= Double(frame) {
+                ring.pushPCM16(packet, isUSB: false)
+                arrival += interval
+            }
+            ring.pull(left: output, right: nil, frameCount: 240)
+        }
+        // Classify any final pending underrun as a stall, then inspect the counters.
+        ring.pushPCM16(packet, isUSB: false)
+        let result = ring.diagnostics()
+        check(result.underruns == 0 && result.trimmedFrames == 0,
+              "30 min at \(ppm) ppm: \(result.underruns) underruns, \(result.trimmedFrames) trimmed frames")
+    }
+
     static func main() {
         testUnderruns()
         testSessions()
-        print("Swift underrun, adaptive-buffer and session tests passed.")
+        testDrift(ppm: -200)
+        testDrift(ppm: 200)
+        print("Swift underrun, adaptive-buffer, session and 30-minute drift tests passed.")
     }
 }
