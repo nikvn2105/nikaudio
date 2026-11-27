@@ -1,4 +1,6 @@
 import SwiftUI
+import AVKit
+import UIKit
 
 struct ContentView: View {
     @Environment(\.scenePhase) private var scenePhase
@@ -92,10 +94,7 @@ struct ContentView: View {
                         .font(AppFont.regular(15, relativeTo: .subheadline))
                         .foregroundStyle(.secondary)
                 }
-                Label(receiver.outputRoute, systemImage: "headphones")
-                    .font(AppFont.regular(15, relativeTo: .subheadline))
-                    .foregroundStyle(.secondary)
-                    .accessibilityLabel("Đầu ra âm thanh: \(receiver.outputRoute)")
+                AudioOutputRow(route: receiver.outputRoute)
             }
 
             Button {
@@ -296,6 +295,47 @@ struct ContentView: View {
         .font(AppFont.regular(15, relativeTo: .subheadline))
         .accessibilityElement(children: .combine)
     }
+}
+
+private struct AudioOutputRow: View {
+    let route: String
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: "headphones")
+                .foregroundStyle(GlassTheme.mint)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 3) {
+                Text("Đầu ra âm thanh")
+                    .font(AppFont.bold(13, relativeTo: .footnote))
+                    .foregroundStyle(.secondary)
+                Text(route)
+                    .font(AppFont.regular(15, relativeTo: .subheadline))
+            }
+            .accessibilityElement(children: .combine)
+            Spacer(minLength: 4)
+            SystemAudioRoutePicker()
+                .frame(width: 48, height: 48)
+                .background(GlassTheme.mint.opacity(0.12), in: RoundedRectangle(cornerRadius: 13))
+                .accessibilityLabel("Chọn đầu ra âm thanh")
+        }
+        .padding(.leading, 13)
+        .padding(.trailing, 5)
+        .padding(.vertical, 5)
+        .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 17))
+    }
+}
+
+private struct SystemAudioRoutePicker: UIViewRepresentable {
+    func makeUIView(context: Context) -> AVRoutePickerView {
+        let picker = AVRoutePickerView()
+        picker.prioritizesVideoDevices = false
+        picker.tintColor = UIColor(GlassTheme.mint)
+        picker.activeTintColor = UIColor(GlassTheme.lilac)
+        return picker
+    }
+
+    func updateUIView(_ picker: AVRoutePickerView, context: Context) {}
 }
 
 private enum AppFont {

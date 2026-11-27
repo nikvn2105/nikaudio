@@ -1,5 +1,7 @@
 #include "font_resources.h"
 
+IDI_NIKAUDIO ICON "pc/NiKAudio.ico"
+
 IDR_FONT_REGULAR RCDATA "assets/fonts/BeVietnamPro-Regular.ttf"
 IDR_FONT_BOLD RCDATA "assets/fonts/BeVietnamPro-Bold.ttf"
 IDR_FONT_LICENSE RCDATA "assets/fonts/OFL.txt"
