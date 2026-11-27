@@ -242,7 +242,7 @@ final class AudioReceiver: NSObject, ObservableObject {
     private var lastEngineStart: TimeInterval = 0
     private var audioInterrupted = false
     private var lanKey: SymmetricKey?
-    private var lanSessions: [Data: LANSession] = [:]
+    private var lanSessions = LANSessionTable()
 
     private var udpListener: NWListener?
     private var tcpListener: NWListener?
@@ -331,7 +331,7 @@ final class AudioReceiver: NSObject, ObservableObject {
             self.lateCounter = 0
             self.handoffMs = nil
             self.lanKey = key.map { SymmetricKey(data: $0) }
-            self.lanSessions.removeAll()
+            self.lanSessions.clear()
         }
 
         do {
@@ -372,7 +372,7 @@ final class AudioReceiver: NSObject, ObservableObject {
             for conn in self.activeUDPConnections { conn.cancel() }
             self.activeUDPConnections.removeAll()
             self.authenticatedAudioConnection = nil
-            self.lanSessions.removeAll()
+            self.lanSessions.clear()
             self.lanKey = nil
             self.packetCounter = 0
             self.hasSeq = false
@@ -441,7 +441,7 @@ final class AudioReceiver: NSObject, ObservableObject {
         let key = try (renew ? LANPairing.renewKey() : LANPairing.key())
         netQueue.async { [weak self] in
             self?.lanKey = SymmetricKey(data: key)
-            if renew { self?.lanSessions.removeAll() }
+            if renew { self?.lanSessions.clear() }
         }
         return key.map { String(format: "%02x", $0) }.joined()
     }
@@ -641,19 +641,14 @@ final class AudioReceiver: NSObject, ObservableObject {
             let tag = data.suffix(LANPairing.tagSize)
             guard HMAC<SHA256>.isValidAuthenticationCode(tag, authenticating: signed, using: key) else { return }
             let challenge = Data(signed.dropFirst(4))
-            lanSessions = lanSessions.filter { now < $0.value.expiresAt }
-            let session: LANSession
-            if let existing = lanSessions.values.first(where: { $0.challenge == challenge }) {
-                session = existing
-            } else {
-                guard lanSessions.count < 12,
-                      let nonce = LANPairing.randomBytes(count: LANPairing.nonceSize) else { return }
+            let session = lanSessions.session(for: challenge, now: now) {
+                guard let nonce = LANPairing.randomBytes(count: LANPairing.nonceSize) else { return nil }
                 let material = HMAC<SHA256>.authenticationCode(for: nonce, using: key)
-                session = LANSession(challenge: challenge, nonce: nonce, expiresAt: now + 25,
-                                     key: SymmetricKey(data: Data(material)),
-                                     lastAudioSeq: nil, lastHeartbeatSeq: nil)
-                lanSessions[nonce] = session
+                return LANSession(challenge: challenge, nonce: nonce, expiresAt: now + 25,
+                                  key: SymmetricKey(data: Data(material)),
+                                  lastAudioSeq: nil, lastHeartbeatSeq: nil)
             }
+            guard let session = session else { return }
             var response = Data("NIKR".utf8)
             response.append(challenge)
             response.append(session.nonce)
@@ -671,7 +666,7 @@ final class AudioReceiver: NSObject, ObservableObject {
               data.count == prefixSize + payloadLen + LANPairing.cipherTagSize else { return }
         let prefix = data.prefix(prefixSize)
         let nonce = Data(prefix.suffix(LANPairing.nonceSize))
-        guard var session = lanSessions[nonce], now < session.expiresAt else { return }
+        guard var session = lanSessions.lookup(nonce, now: now) else { return }
         let seq = data.readUInt32LE(at: 4)
         guard let payload = session.decrypt(data, prefixSize: prefixSize, payloadLength: payloadLen,
                                             flags: flags) else { return }
@@ -679,7 +674,7 @@ final class AudioReceiver: NSObject, ObservableObject {
             if flags == 0 { recordLatePacket(seq: seq) }
             return
         }
-        lanSessions[nonce] = session
+        lanSessions.update(session, audio: flags == 0)
         authenticatedAudioConnection = connection
         ingestPacket(seq: seq, payload: payload, isUSB: false)
     }

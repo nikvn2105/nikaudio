@@ -484,7 +484,7 @@ private:
         }
         if (!locals.empty()) discoveryOffset_ += 256;
 
-        const auto deadline = Clock::now() + std::chrono::milliseconds(200);
+        const auto deadline = Clock::now() + std::chrono::milliseconds(500);
         while (running_) {
             const auto remaining = std::chrono::ceil<std::chrono::microseconds>(deadline - Clock::now()).count();
             if (remaining <= 0) break;
