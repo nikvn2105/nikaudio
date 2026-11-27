@@ -41,6 +41,7 @@
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "comdlg32.lib")
+#pragma comment(lib, "dnsapi.lib")
 
 static constexpr uint16_t TARGET_PORT = 55123;
 static constexpr uint32_t OUT_SAMPLE_RATE = 48000;
@@ -88,6 +89,7 @@ static bool recvAll(SOCKET s, char* data, int len) {
 }
 
 #include "file_transfer.h"
+#include "screen_receiver.h"
 #include "tray.h"
 
 // MARK: - Windows usbmuxd Client (127.0.0.1:27015)
@@ -394,6 +396,12 @@ public:
         if (enabled_) sendPacket(pcmStereo, frames, captureResumed);
     }
 
+    bool audioOnLAN() {
+        std::lock_guard<std::mutex> lock(mu_);
+        return enabled_ && usbSock_ == INVALID_SOCKET && lanReady() &&
+               Clock::now() - lastAudioSent_ < std::chrono::milliseconds(500);
+    }
+
     unsigned sequence() const { return seq_; }
 
     std::wstring windowStatus() {
@@ -431,6 +439,7 @@ private:
         if (!heartbeat) std::memcpy(packet.data() + sizeof(header), pcm, header.payloadLen);
         const int length = sizeof(header) + header.payloadLen;
         lastSent_ = Clock::now();
+        if (!heartbeat) lastAudioSent_ = lastSent_;
 
         if (usbSock_ != INVALID_SOCKET) {
             if (!sendAll(usbSock_, reinterpret_cast<const char*>(packet.data()), length)) {
@@ -628,7 +637,7 @@ private:
     LanNonce lanNonce_{};
     Clock::time_point lanConfirmed_{};
     Clock::time_point usbOverlapUntil_{};
-    Clock::time_point lastSent_{};
+    Clock::time_point lastSent_{}, lastAudioSent_{};
     std::string manualLanIP_;
     std::string currentLanIP_;
     std::thread monitorThread_;
@@ -705,10 +714,11 @@ int main(int argc, char* argv[]) {
     SetProcessDPIAware();
     {
         DualTransport transport(manualIP);
-        FileTransfer::Server files(localFileAddresses());
+        FileTransfer::Server files(localFileAddresses(), [&] { return transport.audioOnLAN(); });
+        ScreenReceiver::Server screen;
         Tray tray([&] { return transport.windowStatus(); },
                   [&](const PairingKey& key) { return transport.pair(key); },
-                  [&] { return transport.forgetPairing(); }, readUSBPairingKey, files);
+                  [&] { return transport.forgetPairing(); }, readUSBPairingKey, files, screen);
         auto lastLog = std::chrono::steady_clock::now();
 
         while (!tray.quitting) {

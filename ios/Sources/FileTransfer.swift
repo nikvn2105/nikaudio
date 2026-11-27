@@ -2,21 +2,6 @@ import CryptoKit
 import Foundation
 import Network
 
-enum FileTransferError: LocalizedError {
-    case invalidAddress, invalidReply, missingFile, connectionLost, integrity, remote(String)
-
-    var errorDescription: String? {
-        switch self {
-        case .invalidAddress: return "Nhập đúng địa chỉ IPv4 của máy Windows."
-        case .invalidReply: return "Không xác thực được máy tính hoặc phản hồi không hợp lệ."
-        case .missingFile: return "Không đọc được tệp hoặc tệp vượt giới hạn."
-        case .connectionLost: return "Mất kết nối với máy tính. Thử lại để tiếp tục."
-        case .integrity: return "Tệp không khớp mã kiểm tra. Hãy thử gửi lại."
-        case .remote(let message): return message
-        }
-    }
-}
-
 enum FileTransfer {
     static let port: UInt16 = 55124
     static let block = 256 * 1024
@@ -62,12 +47,12 @@ enum FileTransfer {
         }
     }
 
-    static func upload(_ file: URL, address: String, key: Data,
+    static func upload(_ file: URL, endpoint: NWEndpoint, key: Data,
                        progress: @escaping @Sendable (Progress) -> Void) async throws {
         let securityScope = file.startAccessingSecurityScopedResource()
         defer { if securityScope { file.stopAccessingSecurityScopedResource() } }
         let offer = try await Offer(file: file)
-        let channel = try FileChannel(address: address, pairingKey: key)
+        let channel = FileChannel(endpoint: endpoint, pairingKey: key)
         defer { channel.close() }
         try await channel.authenticate()
         try await channel.send(offer.uploadRequest)
@@ -87,7 +72,9 @@ enum FileTransfer {
             guard let data = try fileHandle.read(upToCount: count), !data.isEmpty else {
                 throw FileTransferError.missingFile
             }
+            let transferStart = ProcessInfo.processInfo.systemUptime
             try await channel.send(Data([4]) + data)
+            try await BulkTraffic.shared.pace(bytes: data.count, since: transferStart)
             completed += UInt64(data.count)
             report(completed, offer.size, resumed, start, &lastProgress, progress)
         }
@@ -95,14 +82,32 @@ enum FileTransfer {
         guard try await channel.receive() == Data([6]) else { throw FileTransferError.invalidReply }
     }
 
-    static func download(address: String, key: Data,
+    static func download(endpoint: NWEndpoint, key: Data,
                          progress: @escaping @Sendable (Progress) -> Void) async throws -> URL {
-        let channel = try FileChannel(address: address, pairingKey: key)
+        let channel = FileChannel(endpoint: endpoint, pairingKey: key)
         defer { channel.close() }
         try await channel.authenticate()
         try await channel.send(Data([2]))
         let offer = try await Offer(reply: channel.receive())
         let manager = FileManager.default
+        let folder = try manager.url(for: .documentDirectory, in: .userDomainMask,
+                                     appropriateFor: nil, create: true).appendingPathComponent("NiKAudio")
+        try manager.createDirectory(at: folder, withIntermediateDirectories: true)
+        let basename = safeFilename(offer.name)
+        var target = folder.appendingPathComponent(basename)
+        var index = 1
+        while manager.fileExists(atPath: target.path) {
+            let values = try target.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey])
+            if values.isRegularFile == true, let size = values.fileSize, UInt64(size) == offer.size,
+               try await digest(of: target, keepAlive: channel) == offer.digest {
+                try await channel.send(Data([3]) + Data(fileLE: offer.size))
+                guard try await channel.receive() == Data([5]) else { throw FileTransferError.invalidReply }
+                try? await channel.send(Data([6]))
+                return target
+            }
+            target = folder.appendingPathComponent("\(index) - \(basename)")
+            index += 1
+        }
         let parts = try manager.url(for: .applicationSupportDirectory, in: .userDomainMask,
                                     appropriateFor: nil, create: true).appendingPathComponent("FileTransfers")
         try manager.createDirectory(at: parts, withIntermediateDirectories: true)
@@ -125,11 +130,13 @@ enum FileTransfer {
         var lastProgress = start - 1
         while completed < offer.size {
             try Task.checkCancellation()
+            let transferStart = ProcessInfo.processInfo.systemUptime
             let data = try await channel.receive()
             guard data.first == 4, data.count > 1, UInt64(data.count - 1) <= offer.size - completed else {
                 throw FileTransferError.invalidReply
             }
             try fileHandle.write(contentsOf: data.dropFirst())
+            try await BulkTraffic.shared.pace(bytes: data.count - 1, since: transferStart)
             completed += UInt64(data.count - 1)
             report(completed, offer.size, resumed, start, &lastProgress, progress)
         }
@@ -138,16 +145,6 @@ enum FileTransfer {
         guard try await digest(of: partial, keepAlive: channel) == offer.digest else {
             try? manager.removeItem(at: partial)
             throw FileTransferError.integrity
-        }
-        let folder = try manager.url(for: .documentDirectory, in: .userDomainMask,
-                                     appropriateFor: nil, create: true).appendingPathComponent("NiKAudio")
-        try manager.createDirectory(at: folder, withIntermediateDirectories: true)
-        let basename = safeFilename(offer.name)
-        var target = folder.appendingPathComponent(basename)
-        var index = 1
-        while manager.fileExists(atPath: target.path) {
-            target = folder.appendingPathComponent("\(index) - \(basename)")
-            index += 1
         }
         try manager.moveItem(at: partial, to: target)
         // The file is already saved if the peer disconnects before receiving the final acknowledgement.
@@ -195,126 +192,5 @@ enum FileTransfer {
         last = now
         callback(Progress(total: total, completed: completed,
                           bytesPerSecond: Double(completed - offset) / max(now - start, 0.01)))
-    }
-}
-
-private final class FileChannel {
-    private let connection: NWConnection
-    private let queue = DispatchQueue(label: "NiKAudio.file-transfer")
-    private let pairingKey: SymmetricKey
-    private var sender: SymmetricKey?
-    private var receiver: SymmetricKey?
-    private var sendCounter: UInt32 = 0
-    private var receiveCounter: UInt32 = 0
-
-    init(address: String, pairingKey: Data) throws {
-        guard let ip = IPv4Address(address), let port = NWEndpoint.Port(rawValue: FileTransfer.port) else {
-            throw FileTransferError.invalidAddress
-        }
-        self.pairingKey = SymmetricKey(data: pairingKey)
-        let params = NWParameters.tcp
-        params.serviceClass = .background
-        connection = NWConnection(host: .ipv4(ip), port: port, using: params)
-        connection.start(queue: queue)
-    }
-
-    func close() { connection.cancel() }
-
-    func authenticate() async throws {
-        guard let nonce = LANPairing.randomBytes(count: 16) else { throw FileTransferError.invalidReply }
-        let hello = Data("NIKF".utf8) + Data([1]) + nonce
-        try await write(hello)
-        let reply = try await read(count: 48)
-        let transcript = hello + reply.prefix(16)
-        guard HMAC<SHA256>.isValidAuthenticationCode(reply.suffix(32), authenticating: transcript + Data([0]),
-                                                    using: pairingKey) else {
-            throw FileTransferError.invalidReply
-        }
-        func derive(_ role: UInt8) -> SymmetricKey {
-            SymmetricKey(data: Data(HMAC<SHA256>.authenticationCode(for: transcript + Data([role]), using: pairingKey)))
-        }
-        sender = derive(1)
-        receiver = derive(2)
-    }
-
-    func send(_ data: Data) async throws {
-        guard let sender = sender, !data.isEmpty, data.count <= FileTransfer.block + 1,
-              sendCounter != UInt32.max else { throw FileTransferError.invalidReply }
-        let header = Data(fileLE: UInt32(data.count))
-        let box = try AES.GCM.seal(data, using: sender, nonce: nonce(sendCounter), authenticating: header)
-        sendCounter += 1
-        try await write(header + box.ciphertext + box.tag)
-    }
-
-    func receive() async throws -> Data {
-        while true {
-            let data = try await receiveRecord()
-            if data != Data([8]) { return data }
-        }
-    }
-
-    private func receiveRecord() async throws -> Data {
-        guard let receiver = receiver, receiveCounter != UInt32.max else { throw FileTransferError.invalidReply }
-        let header = try await read(count: 4)
-        let size: UInt32 = header.fileLE(at: 0)
-        guard size > 0 && size <= FileTransfer.block + 1 else { throw FileTransferError.invalidReply }
-        let payload = try await read(count: Int(size) + 16)
-        let box = try AES.GCM.SealedBox(nonce: nonce(receiveCounter), ciphertext: payload.dropLast(16),
-                                       tag: payload.suffix(16))
-        let data = try AES.GCM.open(box, using: receiver, authenticating: header)
-        receiveCounter += 1
-        if data.first == 255 {
-            throw FileTransferError.remote(String(decoding: data.dropFirst(), as: UTF8.self))
-        }
-        return data
-    }
-
-    private func nonce(_ counter: UInt32) throws -> AES.GCM.Nonce {
-        try AES.GCM.Nonce(data: Data(fileLE: counter) + Data(count: 8))
-    }
-
-    private func deadline() -> DispatchWorkItem {
-        let item = DispatchWorkItem { [connection] in connection.cancel() }
-        queue.asyncAfter(deadline: .now() + 30, execute: item)
-        return item
-    }
-
-    private func write(_ data: Data) async throws {
-        try Task.checkCancellation()
-        try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
-                let timer = deadline()
-                connection.send(content: data, completion: .contentProcessed { error in
-                    timer.cancel()
-                    if error != nil { continuation.resume(throwing: FileTransferError.connectionLost) }
-                    else { continuation.resume() }
-                })
-            }
-        } onCancel: { [connection] in connection.cancel() }
-    }
-
-    private func read(count: Int) async throws -> Data {
-        try Task.checkCancellation()
-        return try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { continuation in
-                let timer = deadline()
-                connection.receive(minimumIncompleteLength: count, maximumLength: count) { data, _, _, error in
-                    timer.cancel()
-                    if error == nil, let data = data, data.count == count { continuation.resume(returning: data) }
-                    else { continuation.resume(throwing: FileTransferError.connectionLost) }
-                }
-            }
-        } onCancel: { [connection] in connection.cancel() }
-    }
-}
-
-private extension Data {
-    init<T: FixedWidthInteger>(fileLE value: T) {
-        var bytes = value.littleEndian
-        self = Swift.withUnsafeBytes(of: &bytes) { Data($0) }
-    }
-
-    func fileLE<T: FixedWidthInteger>(at offset: Int) -> T {
-        withUnsafeBytes { T(littleEndian: $0.loadUnaligned(fromByteOffset: offset, as: T.self)) }
     }
 }
