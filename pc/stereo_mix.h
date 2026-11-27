@@ -2,6 +2,7 @@
 
 #include <windows.h>
 #include <mmreg.h>
+#include <ks.h>
 #include <ksmedia.h>
 #include <algorithm>
 #include <cmath>
