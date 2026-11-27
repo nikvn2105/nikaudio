@@ -566,7 +566,7 @@ private:
         while (running_) {
             std::this_thread::sleep_for(std::chrono::milliseconds(80));
             std::lock_guard<std::mutex> lock(mu_);
-            if (running_ && enabled_ && Clock::now() - lastSent_ >= std::chrono::milliseconds(250)) {
+            if (running_ && Clock::now() - lastSent_ >= std::chrono::milliseconds(250)) {
                 sendPacket(nullptr, 0);
             }
         }
