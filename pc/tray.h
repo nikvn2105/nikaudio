@@ -217,7 +217,7 @@ private:
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(menu, MF_STRING, toggle, enabled ? L"Pause streaming" : L"Resume streaming");
         AppendMenuW(menu, MF_STRING, pair, L"Pair using key from clipboard");
-        AppendMenuW(menu, MF_STRING, pairUSB, L"Ghép đôi qua USB");
+        AppendMenuW(menu, MF_STRING | (usbPairingInProgress_ ? MF_GRAYED : MF_ENABLED), pairUSB, L"Ghép đôi qua USB");
         AppendMenuW(menu, MF_STRING, forget, L"Forget paired iPhone");
         AppendMenuW(menu, enabled ? MF_STRING : MF_STRING | MF_GRAYED, pulse, L"Play latency test pulses");
         AppendMenuW(menu, MF_STRING, stopPulse, L"Stop latency test");
@@ -269,7 +269,8 @@ private:
     }
 
     void beginUSBPairing(HWND window) {
-        if (usbWorker_.joinable()) return;
+        if (usbPairingInProgress_) return;
+        usbPairingInProgress_ = true;
         EnableWindow(GetDlgItem(window, pairUSB), FALSE);
         usbWorker_ = std::thread([this, window] {
             const bool received = receiveUSBKey_(pendingKey_);
@@ -291,6 +292,7 @@ private:
             }
         }
         SecureZeroMemory(pendingKey_.data(), pendingKey_.size());
+        usbPairingInProgress_ = false;
         EnableWindow(GetDlgItem(window, pairUSB), TRUE);
         refresh(window);
     }
@@ -329,6 +331,7 @@ private:
     ReceiveUSBKey receiveUSBKey_;
     PairingKey pendingKey_{};
     std::thread usbWorker_;
+    bool usbPairingInProgress_ = false;
     UINT taskbarCreated_{0};
     bool ownsConsole_{false};
     bool iconVisible_{false};
