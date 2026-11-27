@@ -1,6 +1,7 @@
 import SwiftUI
 
 struct ContentView: View {
+    @Environment(\.scenePhase) private var scenePhase
     @StateObject private var receiver = AudioReceiver()
     @State private var showPairing = false
     @State private var showDiagnostics = false
@@ -21,10 +22,11 @@ struct ContentView: View {
     }
 
     private var statusDetail: String? {
-        if receiver.isRunning && receiver.pcIdle { return receiver.mode.rawValue }
         if receiver.statusMessage.hasPrefix("Lỗi") || receiver.statusMessage.hasPrefix("Đang chờ mở cổng") {
             return receiver.statusMessage
         }
+        if receiver.needsAudioRecovery { return "Phát âm thanh đang bị gián đoạn." }
+        if receiver.isRunning && receiver.pcIdle { return receiver.mode.rawValue }
         return nil
     }
 
@@ -63,6 +65,9 @@ struct ContentView: View {
         }
         .background(GlassBackdrop())
         .font(AppFont.regular(17, relativeTo: .body))
+        .onChange(of: scenePhase) { phase in
+            if phase == .active { receiver.recoverAudioIfNeeded() }
+        }
         .sheet(isPresented: $showPairing, onDismiss: { pairingKey = "" }) {
             pairingSheet
         }
@@ -106,6 +111,11 @@ struct ContentView: View {
                                 in: RoundedRectangle(cornerRadius: 18))
             }
             .buttonStyle(.plain)
+            if receiver.needsAudioRecovery {
+                Button("Khôi phục âm thanh") { receiver.recoverAudio() }
+                    .buttonStyle(.bordered)
+                    .tint(GlassTheme.mint)
+            }
         }
         .padding(20)
         .frame(maxWidth: .infinity, alignment: .leading)

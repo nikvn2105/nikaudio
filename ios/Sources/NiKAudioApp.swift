@@ -226,6 +226,7 @@ final class AudioReceiver: NSObject, ObservableObject {
     @Published private(set) var effectiveTargetMs = 0.0
     @Published private(set) var lastHandoffMs: Double?
     @Published private(set) var pcIdle = false
+    @Published private(set) var needsAudioRecovery = false
     @Published var targetBufferMs: Double = 20.0 {
         didSet { ringBuffer.setTargetMs(targetBufferMs) }
     }
@@ -314,6 +315,7 @@ final class AudioReceiver: NSObject, ObservableObject {
         let session = UUID()
         listenerSession = session
         audioInterrupted = false
+        needsAudioRecovery = false
         let key = try? LANPairing.key()
         ringBuffer.setTargetMs(targetBufferMs)
         ringBuffer.reset()
@@ -385,6 +387,7 @@ final class AudioReceiver: NSObject, ObservableObject {
         }
 
         isRunning = false
+        needsAudioRecovery = false
         mode = .waiting
         packetsPerSec = 0
         bufferMs = 0
@@ -443,6 +446,17 @@ final class AudioReceiver: NSObject, ObservableObject {
         return key.map { String(format: "%02x", $0) }.joined()
     }
 
+    func recoverAudio() {
+        guard isRunning else { return }
+        audioInterrupted = false
+        scheduleEngineRestart()
+    }
+
+    func recoverAudioIfNeeded() {
+        guard isRunning, audioInterrupted || engine?.isRunning != true else { return }
+        recoverAudio()
+    }
+
     private func scheduleEngineRestart(attempt: Int = 0) {
         guard let session = listenerSession, isRunning, !audioInterrupted else { return }
         restartWork?.cancel()
@@ -454,10 +468,15 @@ final class AudioReceiver: NSObject, ObservableObject {
             do {
                 try self.setupAudioSessionAndEngine()
                 self.statusMessage = self.listenerStatus
+                self.needsAudioRecovery = false
                 self.updateOutputRoute()
             } catch {
-                self.statusMessage = "Lỗi khởi động lại âm thanh: \(error.localizedDescription)"
-                if attempt < 2 { self.scheduleEngineRestart(attempt: attempt + 1) }
+                self.statusMessage = "Lỗi khôi phục âm thanh: \(error.localizedDescription)"
+                if attempt < 2 {
+                    self.scheduleEngineRestart(attempt: attempt + 1)
+                } else {
+                    self.needsAudioRecovery = true
+                }
             }
         }
         restartWork = work
@@ -775,14 +794,25 @@ final class AudioReceiver: NSObject, ObservableObject {
         guard let info = notification.userInfo,
               let typeVal = info[AVAudioSessionInterruptionTypeKey] as? UInt,
               let type = AVAudioSession.InterruptionType(rawValue: typeVal) else { return }
+        let optionBits = info[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0
+        let shouldResume = AVAudioSession.InterruptionOptions(rawValue: optionBits).contains(.shouldResume)
         DispatchQueue.main.async { [weak self] in
             guard let self = self, self.isRunning else { return }
-            self.audioInterrupted = type == .began
-            if self.audioInterrupted {
+            switch type {
+            case .began:
+                self.audioInterrupted = true
+                self.needsAudioRecovery = true
                 self.restartWork?.cancel()
                 self.restartWork = nil
-            } else {
-                self.scheduleEngineRestart()
+            case .ended:
+                if shouldResume {
+                    self.recoverAudio()
+                } else {
+                    self.audioInterrupted = true
+                    self.needsAudioRecovery = true
+                }
+            @unknown default:
+                break
             }
         }
     }
