@@ -28,6 +28,12 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           .\NiKAudioLanTest.exe
 
+      - name: Verify stereo downmix and limiter
+        run: |
+          cl /nologo /O2 /EHsc /std:c++17 /MT /W3 tests\stereo_mix.cpp /Fe:NiKAudioStereoTest.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\NiKAudioStereoTest.exe
+
       - name: Upload Windows EXE
         uses: actions/upload-artifact@v4
         with:
@@ -38,6 +44,11 @@ jobs:
     runs-on: macos-26-intel
     steps:
       - uses: actions/checkout@v4
+
+      - name: Verify audio recovery logic
+        run: |
+          swiftc -O -swift-version 5 ios/Sources/AudioRingBuffer.swift ios/Sources/LANSession.swift tests/audio_core.swift -o "$RUNNER_TEMP/nikaudio-audio-tests"
+          "$RUNNER_TEMP/nikaudio-audio-tests"
 
       - name: Install XcodeGen
         run: brew install xcodegen

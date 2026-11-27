@@ -26,6 +26,7 @@
 
 #include "lan_auth.h"
 #include "latency_pulse.h"
+#include "stereo_mix.h"
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "iphlpapi.lib")
@@ -45,6 +46,8 @@ static constexpr uint16_t TARGET_PORT = 55123;
 static constexpr uint32_t OUT_SAMPLE_RATE = 48000;
 static constexpr size_t PACKET_FRAMES = 120; // 2.5ms @ 48kHz
 static constexpr size_t PACKET_PCM_BYTES = PACKET_FRAMES * 4; // Stereo Int16
+static constexpr uint16_t FLAG_HEARTBEAT = 1;
+static constexpr uint16_t FLAG_CAPTURE_RESUMED = 2;
 
 #pragma pack(push, 1)
 struct AudioPacketHeader {
@@ -255,6 +258,24 @@ static SOCKET openUSBTunnelToPhone(uint16_t phonePort) {
     return s;
 }
 
+static bool readUSBPairingKey(PairingKey& key) {
+    const SOCKET socket = openUSBTunnelToPhone(TARGET_PORT);
+    if (socket == INVALID_SOCKET) return false;
+
+    constexpr char request[] = {'N', 'I', 'K', 'P', 1, 0, 0, 0};
+    constexpr char expected[] = {'N', 'I', 'K', 'Q', 1, 0, 32, 0};
+    char response[sizeof(expected) + 32]{};
+    const bool received = sendAll(socket, request, sizeof(request)) &&
+                          recvAll(socket, response, sizeof(response)) &&
+                          std::memcmp(response, expected, sizeof(expected)) == 0 &&
+                          std::any_of(response + sizeof(expected), response + sizeof(response),
+                                      [](char byte) { return byte != 0; });
+    if (received) std::memcpy(key.data(), response + sizeof(expected), key.size());
+    SecureZeroMemory(response, sizeof(response));
+    closesocket(socket);
+    return received;
+}
+
 // MARK: - Local IPv4 Subnet Enumeration for Unicast LAN Discovery
 
 struct LocalIPv4 {
@@ -368,9 +389,9 @@ public:
         return true;
     }
 
-    void sendAudioPacket(const int16_t* pcmStereo, size_t frames) {
+    void sendAudioPacket(const int16_t* pcmStereo, size_t frames, bool captureResumed) {
         std::lock_guard<std::mutex> lock(mu_);
-        if (enabled_) sendPacket(pcmStereo, frames);
+        if (enabled_) sendPacket(pcmStereo, frames, captureResumed);
     }
 
     unsigned sequence() const { return seq_; }
@@ -379,7 +400,7 @@ public:
         std::lock_guard<std::mutex> lock(mu_);
         if (usbSock_ != INVALID_SOCKET) return L"Đang gửi qua Lightning";
         if (lanReady()) return L"Đang gửi qua Wi-Fi";
-        return hasPairingKey_ ? L"Đang tìm iPhone" : L"Đang chờ iPhone";
+        return hasPairingKey_ ? L"Đang tìm iPhone" : L"Cần ghép đôi để dùng Wi-Fi";
     }
 
     std::string statusText() {
@@ -400,11 +421,12 @@ private:
     }
 
     // Called with mu_ held, so heartbeats and audio share one ordered sequence.
-    void sendPacket(const int16_t* pcm, size_t frames) {
+    void sendPacket(const int16_t* pcm, size_t frames, bool captureResumed = false) {
         std::array<uint8_t, sizeof(AudioPacketHeader) + PACKET_PCM_BYTES> packet{};
         const bool heartbeat = frames == 0;
+        const uint16_t flags = heartbeat ? FLAG_HEARTBEAT : (captureResumed ? FLAG_CAPTURE_RESUMED : 0);
         const AudioPacketHeader header{{'N','I','K','A'}, heartbeat ? ++heartbeatSeq_ : ++seq_,
-                                       static_cast<uint16_t>(frames * 4), static_cast<uint16_t>(heartbeat ? 1 : 0)};
+                                       static_cast<uint16_t>(frames * 4), flags};
         std::memcpy(packet.data(), &header, sizeof(header));
         if (!heartbeat) std::memcpy(packet.data() + sizeof(header), pcm, header.payloadLen);
         const int length = sizeof(header) + header.payloadLen;
@@ -500,7 +522,7 @@ private:
         }
         if (!locals.empty()) discoveryOffset_ += 256;
 
-        const auto deadline = Clock::now() + std::chrono::milliseconds(200);
+        const auto deadline = Clock::now() + std::chrono::milliseconds(500);
         while (running_) {
             const auto remaining = std::chrono::ceil<std::chrono::microseconds>(deadline - Clock::now()).count();
             if (remaining <= 0) break;
@@ -581,7 +603,7 @@ private:
         while (running_) {
             std::this_thread::sleep_for(std::chrono::milliseconds(80));
             std::lock_guard<std::mutex> lock(mu_);
-            if (running_ && enabled_ && Clock::now() - lastSent_ >= std::chrono::milliseconds(250)) {
+            if (running_ && Clock::now() - lastSent_ >= std::chrono::milliseconds(250)) {
                 sendPacket(nullptr, 0);
             }
         }
@@ -645,66 +667,6 @@ public:
 
 // MARK: - Main: WASAPI Loopback (Auto-Recover) -> 48kHz Stereo Int16 -> DualTransport
 
-struct StereoGain {
-    float left;
-    float right;
-};
-
-static std::vector<StereoGain> stereoGains(unsigned channels, DWORD mask) {
-    if (channels == 1) return {{1.0f, 1.0f}};
-    if (channels == 2) return {{1.0f, 0.0f}, {0.0f, 1.0f}};
-
-    // Extensible PCM orders its channels by ascending speaker bit.
-    unsigned maskChannels = 0;
-    for (DWORD bits = mask; bits != 0; bits &= bits - 1) ++maskChannels;
-    if (maskChannels != channels) {
-        if (channels == 6) mask = KSAUDIO_SPEAKER_5POINT1;
-        else if (channels == 8) mask = KSAUDIO_SPEAKER_7POINT1_SURROUND;
-        else mask = SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT;
-    }
-
-    constexpr float surroundGain = 0.70710678f;
-    std::vector<StereoGain> gains(channels);
-    unsigned channel = 0;
-    float leftSum = 0.0f;
-    float rightSum = 0.0f;
-    for (; mask != 0 && channel < channels; ++channel) {
-        const DWORD speaker = mask & (0u - mask);
-        mask &= mask - 1;
-        auto& gain = gains[channel];
-        switch (speaker) {
-        case SPEAKER_FRONT_LEFT:  gain = {1.0f, 0.0f}; break;
-        case SPEAKER_FRONT_RIGHT: gain = {0.0f, 1.0f}; break;
-        case SPEAKER_BACK_LEFT:
-        case SPEAKER_SIDE_LEFT:
-        case SPEAKER_FRONT_LEFT_OF_CENTER:
-        case SPEAKER_TOP_FRONT_LEFT:
-        case SPEAKER_TOP_BACK_LEFT: gain = {surroundGain, 0.0f}; break;
-        case SPEAKER_BACK_RIGHT:
-        case SPEAKER_SIDE_RIGHT:
-        case SPEAKER_FRONT_RIGHT_OF_CENTER:
-        case SPEAKER_TOP_FRONT_RIGHT:
-        case SPEAKER_TOP_BACK_RIGHT: gain = {0.0f, surroundGain}; break;
-        case SPEAKER_LOW_FREQUENCY: break;
-        default: gain = {surroundGain, surroundGain}; break;
-        }
-        leftSum += gain.left;
-        rightSum += gain.right;
-    }
-    const float peakGain = std::max(1.0f, std::max(leftSum, rightSum));
-    for (auto& gain : gains) {
-        gain.left /= peakGain;
-        gain.right /= peakGain;
-    }
-    return gains;
-}
-
-static inline int16_t floatToInt16(float v) {
-    if (v > 1.0f) v = 1.0f;
-    if (v < -1.0f) v = -1.0f;
-    return static_cast<int16_t>(v * 32767.0f);
-}
-
 int main(int argc, char* argv[]) {
     std::cout << "=== NiKAudio PC Sender (USB Lightning + Wi-Fi LAN) ===\n";
     std::cout << "Cach dung: NiKAudioPC.exe [IP_iPhone_tuy_chon]\n";
@@ -746,7 +708,7 @@ int main(int argc, char* argv[]) {
         FileTransfer::Server files(localFileAddresses());
         Tray tray([&] { return transport.windowStatus(); },
                   [&](const PairingKey& key) { return transport.pair(key); },
-                  [&] { return transport.forgetPairing(); }, files);
+                  [&] { return transport.forgetPairing(); }, readUSBPairingKey, files);
         auto lastLog = std::chrono::steady_clock::now();
 
         while (!tray.quitting) {
@@ -813,6 +775,7 @@ int main(int argc, char* argv[]) {
                 continue;
             }
             const auto gains = stereoGains(inChannels, channelMask);
+            StereoLimiter limiter(inChannels > 2);
             std::cout << "\n[WASAPI] Bat am thanh he thong: " << inRate << " Hz, "
                       << inChannels << " kenh, " << (isFloat ? "Float" : "PCM") << mixFmt->wBitsPerSample << "\n";
 
@@ -839,6 +802,9 @@ int main(int argc, char* argv[]) {
             double resampleStep = static_cast<double>(inRate) / static_cast<double>(OUT_SAMPLE_RATE);
             double resamplePos = 0.0;
             float prevL = 0.0f, prevR = 0.0f;
+            bool prevSurround = false;
+            auto lastCapture = std::chrono::steady_clock::time_point{};
+            bool markCaptureResumed = true;
 
             while (!tray.quitting) {
                 if (!tray.enabled) break;
@@ -869,7 +835,24 @@ int main(int argc, char* argv[]) {
                             break;
                         }
 
+                        const auto capturedAt = std::chrono::steady_clock::now();
+                        if (framesAvailable > 0) {
+                            // Normal loopback bursts can be spaced around 10 ms. Flag a sender-side gap
+                            // independently of network timing or the 250 ms heartbeat cadence.
+                            constexpr auto captureGap = std::chrono::milliseconds(40);
+                            if (capturedAt - lastCapture >= captureGap ||
+                                (flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY)) {
+                                markCaptureResumed = true;
+                                outQueue.clear();
+                                resamplePos = 0.0;
+                                prevL = prevR = 0.0f;
+                                prevSurround = false;
+                            }
+                            lastCapture = capturedAt;
+                        }
+
                         std::vector<float> stereoIn(framesAvailable * 2, 0.0f);
+                        std::vector<uint8_t> surroundIn(inChannels > 2 ? framesAvailable : 0, 0);
                         if (!(flags & AUDCLNT_BUFFERFLAGS_SILENT) && data != nullptr) {
                             for (UINT32 i = 0; i < framesAvailable; ++i) {
                                 float left = 0.0f;
@@ -887,6 +870,11 @@ int main(int argc, char* argv[]) {
                                                     sampleData, sampleBytes);
                                         sample = static_cast<float>(pcm) / 2147483648.0f;
                                     }
+                                    if (inChannels > 2 && sample != 0 &&
+                                        gains[channel].left != 1 && gains[channel].right != 1 &&
+                                        (gains[channel].left != 0 || gains[channel].right != 0)) {
+                                        surroundIn[i] = 1;
+                                    }
                                     left += sample * gains[channel].left;
                                     right += sample * gains[channel].right;
                                 }
@@ -899,8 +887,8 @@ int main(int argc, char* argv[]) {
 
                         if (inRate == OUT_SAMPLE_RATE) {
                             for (UINT32 i = 0; i < framesAvailable; ++i) {
-                                outQueue.push_back(floatToInt16(stereoIn[i * 2]));
-                                outQueue.push_back(floatToInt16(stereoIn[i * 2 + 1]));
+                                limiter.append(stereoIn[i * 2], stereoIn[i * 2 + 1],
+                                               inChannels > 2 && surroundIn[i], outQueue);
                             }
                         } else {
                             while (resamplePos < static_cast<double>(framesAvailable)) {
@@ -910,20 +898,24 @@ int main(int argc, char* argv[]) {
                                 float r0 = (idx == 0) ? prevR : stereoIn[(idx - 1) * 2 + 1];
                                 float l1 = stereoIn[idx * 2];
                                 float r1 = stereoIn[idx * 2 + 1];
-                                outQueue.push_back(floatToInt16(l0 + (l1 - l0) * frac));
-                                outQueue.push_back(floatToInt16(r0 + (r1 - r0) * frac));
+                                const bool mixed = inChannels > 2 &&
+                                    ((idx == 0 ? prevSurround : surroundIn[idx - 1]) ||
+                                     (frac > 0 && surroundIn[idx]));
+                                limiter.append(l0 + (l1 - l0) * frac, r0 + (r1 - r0) * frac, mixed, outQueue);
                                 resamplePos += resampleStep;
                             }
                             resamplePos -= static_cast<double>(framesAvailable);
                             if (framesAvailable > 0) {
                                 prevL = stereoIn[(framesAvailable - 1) * 2];
                                 prevR = stereoIn[(framesAvailable - 1) * 2 + 1];
+                                prevSurround = inChannels > 2 && surroundIn.back();
                             }
                         }
 
                         size_t offset = 0;
                         while (outQueue.size() - offset >= PACKET_FRAMES * 2) {
-                            transport.sendAudioPacket(outQueue.data() + offset, PACKET_FRAMES);
+                            transport.sendAudioPacket(outQueue.data() + offset, PACKET_FRAMES, markCaptureResumed);
+                            markCaptureResumed = false;
                             offset += PACKET_FRAMES * 2;
                         }
                         if (offset > 0) {

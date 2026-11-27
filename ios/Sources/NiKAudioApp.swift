@@ -4,205 +4,6 @@ import AVFAudio
 import Network
 import Darwin
 
-// MARK: - UnfairLock Stereo Float Ring Buffer (48kHz)
-
-final class AudioRingBuffer {
-    private let capacityFrames: Int
-    private let buffer: UnsafeMutablePointer<Float>
-    private var readIndex: Int = 0
-    private var writeIndex: Int = 0
-    private var availableFrames: Int = 0
-    private let lock: UnsafeMutablePointer<os_unfair_lock>
-
-    private var requestedFrames = 960 // 20ms @ 48kHz
-    private var adaptiveFrames = 0
-    private var lastUnderrunCheck = 0
-    private var stableTime: TimeInterval = 0
-    private var minimumRenderFrames = 0
-    private var targetFrames: Int { min(capacityFrames, max(requestedFrames + adaptiveFrames, minimumRenderFrames)) }
-    private var maxFrames: Int { min(capacityFrames, max(targetFrames * 2 + 480, 2400)) }
-    private var primed: Bool = false
-    private var underruns = 0
-    private var fadeInFrames = 0
-
-    private var lastL: Float = 0
-    private var lastR: Float = 0
-
-    init(capacityFrames: Int = 16384) {
-        self.capacityFrames = capacityFrames
-        self.buffer = UnsafeMutablePointer<Float>.allocate(capacity: capacityFrames * 2)
-        self.buffer.initialize(repeating: 0, count: capacityFrames * 2)
-        self.lock = UnsafeMutablePointer<os_unfair_lock>.allocate(capacity: 1)
-        self.lock.initialize(to: os_unfair_lock())
-    }
-
-    deinit {
-        buffer.deallocate()
-        lock.deallocate()
-    }
-
-    func setTargetMs(_ ms: Double) {
-        os_unfair_lock_lock(lock)
-        let clamped = max(10.0, min(60.0, ms))
-        requestedFrames = Int((clamped / 1000.0) * 48000.0)
-        adaptiveFrames = 0
-        stableTime = 0
-        lastUnderrunCheck = underruns
-        os_unfair_lock_unlock(lock)
-    }
-
-    func reset() {
-        os_unfair_lock_lock(lock)
-        readIndex = 0
-        writeIndex = 0
-        availableFrames = 0
-        minimumRenderFrames = 0
-        underruns = 0
-        lastUnderrunCheck = 0
-        adaptiveFrames = 0
-        stableTime = 0
-        fadeInFrames = 0
-        primed = false
-        lastL = 0
-        lastR = 0
-        os_unfair_lock_unlock(lock)
-    }
-
-    func diagnostics() -> (bufferMs: Double, targetMs: Double, underruns: Int) {
-        os_unfair_lock_lock(lock)
-        defer { os_unfair_lock_unlock(lock) }
-        return (Double(availableFrames) / 48, Double(targetFrames) / 48, underruns)
-    }
-
-    func updateAdaptiveTarget(activeLAN: Bool, elapsed: TimeInterval) {
-        os_unfair_lock_lock(lock)
-        defer { os_unfair_lock_unlock(lock) }
-
-        let newUnderruns = underruns - lastUnderrunCheck
-        lastUnderrunCheck = underruns
-        guard activeLAN else {
-            if !primed { adaptiveFrames = 0 }
-            stableTime = 0
-            return
-        }
-
-        if newUnderruns > 0 {
-            // Add 5 ms of network headroom, up to 30 ms above the selected target.
-            adaptiveFrames = min(1440, adaptiveFrames + 240)
-            stableTime = 0
-        } else {
-            stableTime += elapsed
-            if stableTime >= 20 {
-                adaptiveFrames = max(0, adaptiveFrames - 96)
-                stableTime = 0
-            }
-        }
-    }
-
-    func prepareForRouteChange() {
-        os_unfair_lock_lock(lock)
-        defer { os_unfair_lock_unlock(lock) }
-        readIndex = writeIndex
-        availableFrames = 0
-        minimumRenderFrames = 0
-        primed = false
-        lastL = 0
-        lastR = 0
-    }
-
-    func pushPCM16(_ data: Data) {
-        let frameCount = data.count / 4
-        if frameCount <= 0 { return }
-
-        os_unfair_lock_lock(lock)
-        defer { os_unfair_lock_unlock(lock) }
-
-        if availableFrames + frameCount > maxFrames {
-            let excess = (availableFrames + frameCount) - targetFrames
-            let drop = min(excess, availableFrames)
-            readIndex = (readIndex + drop) % capacityFrames
-            availableFrames -= drop
-        }
-
-        let scale: Float = 1.0 / 32768.0
-        data.withUnsafeBytes { rawBuf in
-            for i in 0..<frameCount {
-                if availableFrames >= capacityFrames {
-                    readIndex = (readIndex + 1) % capacityFrames
-                    availableFrames -= 1
-                }
-                let byteOffset = i * 4
-                let l = Float(Int16(littleEndian: rawBuf.loadUnaligned(fromByteOffset: byteOffset, as: Int16.self))) * scale
-                let r = Float(Int16(littleEndian: rawBuf.loadUnaligned(fromByteOffset: byteOffset + 2, as: Int16.self))) * scale
-                let base = writeIndex * 2
-                buffer[base] = l
-                buffer[base + 1] = r
-                writeIndex = (writeIndex + 1) % capacityFrames
-                availableFrames += 1
-            }
-        }
-
-        if !primed && availableFrames >= targetFrames {
-            primed = true
-            fadeInFrames = 240
-        }
-    }
-
-    func pull(left: UnsafeMutablePointer<Float>, right: UnsafeMutablePointer<Float>?, frameCount: Int) {
-        os_unfair_lock_lock(lock)
-        defer { os_unfair_lock_unlock(lock) }
-
-        let oldTarget = targetFrames
-        minimumRenderFrames = max(minimumRenderFrames, frameCount + 480)
-        if targetFrames > oldTarget && availableFrames < targetFrames {
-            primed = false
-        }
-
-        if !primed {
-            var l = lastL
-            var r = lastR
-            for i in 0..<frameCount {
-                l *= 0.92
-                r *= 0.92
-                left[i] = l
-                right?[i] = r
-            }
-            lastL = abs(l) < 1e-5 ? 0 : l
-            lastR = abs(r) < 1e-5 ? 0 : r
-            return
-        }
-
-        let toRead = min(frameCount, availableFrames)
-        for i in 0..<toRead {
-            let base = readIndex * 2
-            let gain = Float(240 - fadeInFrames) / 240
-            let l = buffer[base] * gain
-            let r = buffer[base + 1] * gain
-            fadeInFrames = max(0, fadeInFrames - 1)
-            left[i] = l
-            right?[i] = r
-            lastL = l
-            lastR = r
-            readIndex = (readIndex + 1) % capacityFrames
-        }
-        availableFrames -= toRead
-        if toRead < frameCount {
-            primed = false
-            underruns += 1
-            var l = lastL
-            var r = lastR
-            for i in toRead..<frameCount {
-                l *= 0.92
-                r *= 0.92
-                left[i] = l
-                right?[i] = r
-            }
-            lastL = abs(l) < 1e-5 ? 0 : l
-            lastR = abs(r) < 1e-5 ? 0 : r
-        }
-    }
-}
-
 // MARK: - Dual Transport (USB usbmuxd TCP + LAN UDP) Audio Receiver
 
 enum TransportMode: String {
@@ -226,6 +27,8 @@ final class AudioReceiver: NSObject, ObservableObject {
     @Published private(set) var effectiveTargetMs = 0.0
     @Published private(set) var lastHandoffMs: Double?
     @Published private(set) var pcIdle = false
+    @Published private(set) var needsAudioRecovery = false
+    @Published private(set) var usbPairingMessage: String?
     @Published var targetBufferMs: Double = 20.0 {
         didSet { ringBuffer.setTargetMs(targetBufferMs) }
     }
@@ -241,7 +44,8 @@ final class AudioReceiver: NSObject, ObservableObject {
     private var lastEngineStart: TimeInterval = 0
     private var audioInterrupted = false
     private var lanKey: SymmetricKey?
-    private var lanSessions: [Data: LANSession] = [:]
+    private var lanSessions = LANSessionTable()
+    private var usbKeyOffer: (token: UUID, key: Data, expiry: TimeInterval)?
 
     private var udpListener: NWListener?
     private var tcpListener: NWListener?
@@ -314,6 +118,7 @@ final class AudioReceiver: NSObject, ObservableObject {
         let session = UUID()
         listenerSession = session
         audioInterrupted = false
+        needsAudioRecovery = false
         let key = try? LANPairing.key()
         ringBuffer.setTargetMs(targetBufferMs)
         ringBuffer.reset()
@@ -329,7 +134,7 @@ final class AudioReceiver: NSObject, ObservableObject {
             self.lateCounter = 0
             self.handoffMs = nil
             self.lanKey = key.map { SymmetricKey(data: $0) }
-            self.lanSessions.removeAll()
+            self.lanSessions.clear()
         }
 
         do {
@@ -350,6 +155,7 @@ final class AudioReceiver: NSObject, ObservableObject {
     }
 
     func stop(message: String = "Đã dừng") {
+        cancelUSBPairing()
         let sessionWasOpen = listenerSession != nil
         listenerSession = nil
         restartWork?.cancel()
@@ -370,7 +176,7 @@ final class AudioReceiver: NSObject, ObservableObject {
             for conn in self.activeUDPConnections { conn.cancel() }
             self.activeUDPConnections.removeAll()
             self.authenticatedAudioConnection = nil
-            self.lanSessions.removeAll()
+            self.lanSessions.clear()
             self.lanKey = nil
             self.packetCounter = 0
             self.hasSeq = false
@@ -385,6 +191,7 @@ final class AudioReceiver: NSObject, ObservableObject {
         }
 
         isRunning = false
+        needsAudioRecovery = false
         mode = .waiting
         packetsPerSec = 0
         bufferMs = 0
@@ -438,9 +245,79 @@ final class AudioReceiver: NSObject, ObservableObject {
         let key = try (renew ? LANPairing.renewKey() : LANPairing.key())
         netQueue.async { [weak self] in
             self?.lanKey = SymmetricKey(data: key)
-            if renew { self?.lanSessions.removeAll() }
+            if renew { self?.lanSessions.clear() }
         }
         return key.map { String(format: "%02x", $0) }.joined()
+    }
+
+    func allowUSBPairing() {
+        guard isRunning else { return }
+        do {
+            let key = try LANPairing.key()
+            let token = UUID()
+            usbPairingMessage = "Trong 30 giây, bấm Ghép đôi qua USB trên PC."
+            netQueue.async { [weak self] in
+                self?.usbKeyOffer = (token, key, ProcessInfo.processInfo.systemUptime + 30)
+            }
+            netQueue.asyncAfter(deadline: .now() + 30) { [weak self] in
+                guard let self = self, self.usbKeyOffer?.token == token else { return }
+                self.usbKeyOffer = nil
+                DispatchQueue.main.async { self.usbPairingMessage = "Đã hết thời gian gửi khóa." }
+            }
+        } catch {
+            usbPairingMessage = error.localizedDescription
+        }
+    }
+
+    func cancelUSBPairing() {
+        usbPairingMessage = nil
+        netQueue.async { [weak self] in self?.usbKeyOffer = nil }
+    }
+
+    private func isLoopback(_ endpoint: NWEndpoint) -> Bool {
+        guard case .hostPort(let host, _) = endpoint else { return false }
+        switch host {
+        case .ipv4(let address):
+            return address.rawValue.first == 127
+        case .ipv6(let address):
+            return address == IPv6Address("::1")
+        default:
+            return false
+        }
+    }
+
+    private func replyToUSBPairing(_ request: Data, connection: NWConnection) {
+        guard request == Data([78, 73, 75, 80, 1, 0, 0, 0]), isLoopback(connection.endpoint),
+              let offer = usbKeyOffer, ProcessInfo.processInfo.systemUptime < offer.expiry,
+              offer.key.count == 32 else {
+            connection.cancel()
+            return
+        }
+        usbKeyOffer = nil
+        let header = Data([78, 73, 75, 81, 1, 0, 32, 0]) // NIKQ, version 1, 32-byte key
+        connection.send(content: header + offer.key, contentContext: .finalMessage, isComplete: true,
+                        completion: .contentProcessed { [weak self] error in
+            if error != nil {
+                connection.cancel()
+            } else {
+                self?.netQueue.asyncAfter(deadline: .now() + 3) { connection.cancel() }
+            }
+            DispatchQueue.main.async {
+                self?.usbPairingMessage = error == nil
+                    ? "Đã gửi khóa. Xác nhận lưu trên Windows." : "Không gửi được khóa. Hãy thử lại."
+            }
+        })
+    }
+
+    func recoverAudio() {
+        guard isRunning else { return }
+        audioInterrupted = false
+        scheduleEngineRestart()
+    }
+
+    func recoverAudioIfNeeded() {
+        guard isRunning, audioInterrupted || engine?.isRunning != true else { return }
+        recoverAudio()
     }
 
     private func scheduleEngineRestart(attempt: Int = 0) {
@@ -454,10 +331,15 @@ final class AudioReceiver: NSObject, ObservableObject {
             do {
                 try self.setupAudioSessionAndEngine()
                 self.statusMessage = self.listenerStatus
+                self.needsAudioRecovery = false
                 self.updateOutputRoute()
             } catch {
-                self.statusMessage = "Lỗi khởi động lại âm thanh: \(error.localizedDescription)"
-                if attempt < 2 { self.scheduleEngineRestart(attempt: attempt + 1) }
+                self.statusMessage = "Lỗi khôi phục âm thanh: \(error.localizedDescription)"
+                if attempt < 2 {
+                    self.scheduleEngineRestart(attempt: attempt + 1)
+                } else {
+                    self.needsAudioRecovery = true
+                }
             }
         }
         restartWork = work
@@ -535,6 +417,7 @@ final class AudioReceiver: NSObject, ObservableObject {
 
     private final class TCPStream {
         var buffer = Data()
+        var identifiedAsAudio = false
     }
 
     private func receiveTCPChunk(conn: NWConnection, stream: TCPStream) {
@@ -542,6 +425,24 @@ final class AudioReceiver: NSObject, ObservableObject {
             guard let self = self else { return }
             if let data = data, !data.isEmpty {
                 stream.buffer.append(data)
+                if !stream.identifiedAsAudio {
+                    if stream.buffer.count < 4 {
+                        if isComplete || error != nil { conn.cancel() }
+                        else { self.receiveTCPChunk(conn: conn, stream: stream) }
+                        return
+                    }
+                    if stream.buffer.prefix(4) == Data("NIKP".utf8) {
+                        if stream.buffer.count >= 8 {
+                            self.replyToUSBPairing(stream.buffer, connection: conn)
+                        } else if isComplete || error != nil {
+                            conn.cancel()
+                        } else {
+                            self.receiveTCPChunk(conn: conn, stream: stream)
+                        }
+                        return
+                    }
+                    stream.identifiedAsAudio = true
+                }
                 self.parseTCPStream(&stream.buffer)
             }
             if isComplete || error != nil {
@@ -570,7 +471,7 @@ final class AudioReceiver: NSObject, ObservableObject {
                 if buffer.count < totalLen { return }
                 let payload = buffer.subdata(in: (buffer.startIndex + 12)..<(buffer.startIndex + totalLen))
                 buffer.removeFirst(totalLen)
-                self.ingestPacket(seq: seq, payload: payload, isUSB: true)
+                self.ingestPacket(seq: seq, payload: payload, isUSB: true, captureResumed: flags == 2)
             } else {
                 buffer.removeFirst(1)
             }
@@ -610,7 +511,7 @@ final class AudioReceiver: NSObject, ObservableObject {
     }
 
     private func isValidPacket(payloadLen: Int, flags: UInt16) -> Bool {
-        (flags == 0 && payloadLen == 480) || (flags == 1 && payloadLen == 0)
+        ((flags == 0 || flags == 2) && payloadLen == 480) || (flags == 1 && payloadLen == 0)
     }
 
     private func handleLANDatagram(_ data: Data, connection: NWConnection) {
@@ -622,19 +523,14 @@ final class AudioReceiver: NSObject, ObservableObject {
             let tag = data.suffix(LANPairing.tagSize)
             guard HMAC<SHA256>.isValidAuthenticationCode(tag, authenticating: signed, using: key) else { return }
             let challenge = Data(signed.dropFirst(4))
-            lanSessions = lanSessions.filter { now < $0.value.expiresAt }
-            let session: LANSession
-            if let existing = lanSessions.values.first(where: { $0.challenge == challenge }) {
-                session = existing
-            } else {
-                guard lanSessions.count < 12,
-                      let nonce = LANPairing.randomBytes(count: LANPairing.nonceSize) else { return }
+            let session = lanSessions.session(for: challenge, now: now) {
+                guard let nonce = LANPairing.randomBytes(count: LANPairing.nonceSize) else { return nil }
                 let material = HMAC<SHA256>.authenticationCode(for: nonce, using: key)
-                session = LANSession(challenge: challenge, nonce: nonce, expiresAt: now + 25,
-                                     key: SymmetricKey(data: Data(material)),
-                                     lastAudioSeq: nil, lastHeartbeatSeq: nil)
-                lanSessions[nonce] = session
+                return LANSession(challenge: challenge, nonce: nonce, expiresAt: now + 25,
+                                  key: SymmetricKey(data: Data(material)),
+                                  lastAudioSeq: nil, lastHeartbeatSeq: nil)
             }
+            guard let session = session else { return }
             var response = Data("NIKR".utf8)
             response.append(challenge)
             response.append(session.nonce)
@@ -652,17 +548,17 @@ final class AudioReceiver: NSObject, ObservableObject {
               data.count == prefixSize + payloadLen + LANPairing.cipherTagSize else { return }
         let prefix = data.prefix(prefixSize)
         let nonce = Data(prefix.suffix(LANPairing.nonceSize))
-        guard var session = lanSessions[nonce], now < session.expiresAt else { return }
+        guard var session = lanSessions.lookup(nonce, now: now) else { return }
         let seq = data.readUInt32LE(at: 4)
         guard let payload = session.decrypt(data, prefixSize: prefixSize, payloadLength: payloadLen,
                                             flags: flags) else { return }
         guard session.accept(seq: seq, heartbeat: flags == 1) else {
-            if flags == 0 { recordLatePacket(seq: seq) }
+            if flags != 1 { recordLatePacket(seq: seq) }
             return
         }
-        lanSessions[nonce] = session
+        lanSessions.update(session, audio: flags != 1)
         authenticatedAudioConnection = connection
-        ingestPacket(seq: seq, payload: payload, isUSB: false)
+        ingestPacket(seq: seq, payload: payload, isUSB: false, captureResumed: flags == 2)
     }
 
     private func recordLatePacket(seq: UInt32) {
@@ -673,9 +569,10 @@ final class AudioReceiver: NSObject, ObservableObject {
         }
     }
 
-    private func ingestPacket(seq: UInt32, payload: Data, isUSB: Bool) {
+    private func ingestPacket(seq: UInt32, payload: Data, isUSB: Bool, captureResumed: Bool) {
         let now = ProcessInfo.processInfo.systemUptime
         if payload.isEmpty {
+            ringBuffer.markSenderIdle()
             if now - lastPacketTime > 0.4 && (isUSB || !lastContactIsUSB || now - lastContactTime > 0.7) {
                 lastContactTime = now
                 lastContactIsUSB = isUSB
@@ -703,7 +600,7 @@ final class AudioReceiver: NSObject, ObservableObject {
         lastContactTime = now
         lastContactIsUSB = isUSB
         packetCounter += 1
-        ringBuffer.pushPCM16(payload)
+        ringBuffer.pushPCM16(payload, isUSB: isUSB, captureResumed: captureResumed)
     }
 
     private func startTelemetry() {
@@ -775,14 +672,25 @@ final class AudioReceiver: NSObject, ObservableObject {
         guard let info = notification.userInfo,
               let typeVal = info[AVAudioSessionInterruptionTypeKey] as? UInt,
               let type = AVAudioSession.InterruptionType(rawValue: typeVal) else { return }
+        let optionBits = info[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0
+        let shouldResume = AVAudioSession.InterruptionOptions(rawValue: optionBits).contains(.shouldResume)
         DispatchQueue.main.async { [weak self] in
             guard let self = self, self.isRunning else { return }
-            self.audioInterrupted = type == .began
-            if self.audioInterrupted {
+            switch type {
+            case .began:
+                self.audioInterrupted = true
+                self.needsAudioRecovery = true
                 self.restartWork?.cancel()
                 self.restartWork = nil
-            } else {
-                self.scheduleEngineRestart()
+            case .ended:
+                if shouldResume {
+                    self.recoverAudio()
+                } else {
+                    self.audioInterrupted = true
+                    self.needsAudioRecovery = true
+                }
+            @unknown default:
+                break
             }
         }
     }
