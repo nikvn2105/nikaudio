@@ -135,6 +135,24 @@ public:
                              ciphertext, size, &written, 0) == 0 && written == size;
     }
 
+    bool decrypt(uint32_t seq, uint8_t* header, ULONG headerSize,
+                 uint8_t* ciphertext, ULONG size, uint8_t* plaintext, LanCipherTag& tag) const {
+        if (!key_) return false;
+        uint8_t iv[12]{};
+        std::memcpy(iv, &seq, sizeof(seq));
+        BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO info;
+        BCRYPT_INIT_AUTH_MODE_INFO(info);
+        info.pbNonce = iv;
+        info.cbNonce = sizeof(iv);
+        info.pbAuthData = header;
+        info.cbAuthData = headerSize;
+        info.pbTag = tag.data();
+        info.cbTag = static_cast<ULONG>(tag.size());
+        ULONG written = 0;
+        return BCryptDecrypt(key_, ciphertext, size, &info, nullptr, 0, plaintext, size, &written, 0) == 0 &&
+               written == size;
+    }
+
 private:
     BCRYPT_ALG_HANDLE algorithm_{nullptr};
     BCRYPT_KEY_HANDLE key_{nullptr};

@@ -304,7 +304,7 @@ private struct SystemAudioRoutePicker: UIViewRepresentable {
     func updateUIView(_ picker: AVRoutePickerView, context: Context) {}
 }
 
-private enum AppFont {
+enum AppFont {
     static func regular(_ size: CGFloat, relativeTo style: Font.TextStyle) -> Font {
         .custom("BeVietnamPro-Regular", size: size, relativeTo: style)
     }
@@ -314,12 +314,12 @@ private enum AppFont {
     }
 }
 
-private enum GlassTheme {
+enum GlassTheme {
     static let mint = Color(red: 0.67, green: 0.94, blue: 0.88)
     static let lilac = Color(red: 0.76, green: 0.69, blue: 0.98)
 }
 
-private struct GlassBackdrop: View {
+struct GlassBackdrop: View {
     var body: some View {
         GeometryReader { proxy in
             ZStack {
@@ -383,7 +383,7 @@ private struct GlassPanel: ViewModifier {
     }
 }
 
-private extension View {
+extension View {
     func glassPanel(radius: CGFloat) -> some View {
         modifier(GlassPanel(radius: radius))
     }

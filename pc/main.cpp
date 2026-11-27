@@ -26,7 +26,6 @@
 
 #include "lan_auth.h"
 #include "latency_pulse.h"
-#include "tray.h"
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "iphlpapi.lib")
@@ -40,6 +39,7 @@
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "dwmapi.lib")
+#pragma comment(lib, "comdlg32.lib")
 
 static constexpr uint16_t TARGET_PORT = 55123;
 static constexpr uint32_t OUT_SAMPLE_RATE = 48000;
@@ -83,6 +83,9 @@ static bool recvAll(SOCKET s, char* data, int len) {
     }
     return true;
 }
+
+#include "file_transfer.h"
+#include "tray.h"
 
 // MARK: - Windows usbmuxd Client (127.0.0.1:27015)
 
@@ -293,6 +296,19 @@ static std::vector<LocalIPv4> getActiveLocalIPv4s() {
         }
     }
     return results;
+}
+
+static std::wstring localFileAddresses() {
+    std::string addresses;
+    for (const auto& local : getActiveLocalIPv4s()) {
+        in_addr address{};
+        address.s_addr = htonl(local.ipHostOrder);
+        char text[INET_ADDRSTRLEN]{};
+        if (!inet_ntop(AF_INET, &address, text, sizeof(text))) continue;
+        if (!addresses.empty()) addresses += " · ";
+        addresses += text;
+    }
+    return FileTransfer::widen(addresses);
 }
 
 // MARK: - Transport Manager (Auto USB + Continuous Unicast LAN Discovery)
@@ -727,9 +743,10 @@ int main(int argc, char* argv[]) {
     SetProcessDPIAware();
     {
         DualTransport transport(manualIP);
+        FileTransfer::Server files(localFileAddresses());
         Tray tray([&] { return transport.windowStatus(); },
                   [&](const PairingKey& key) { return transport.pair(key); },
-                  [&] { return transport.forgetPairing(); });
+                  [&] { return transport.forgetPairing(); }, files);
         auto lastLog = std::chrono::steady_clock::now();
 
         while (!tray.quitting) {

@@ -850,8 +850,14 @@ private extension Data {
 struct NiKAudioApp: App {
     var body: some Scene {
         WindowGroup {
-            ContentView()
-                .preferredColorScheme(.dark)
+            TabView {
+                ContentView()
+                    .tabItem { Label("Âm thanh", systemImage: "waveform") }
+                FileTransferView()
+                    .tabItem { Label("Tệp", systemImage: "folder") }
+            }
+            .tint(GlassTheme.mint)
+            .preferredColorScheme(.dark)
         }
     }
 }
