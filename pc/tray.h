@@ -115,7 +115,7 @@ private:
         wc.lpfnWndProc = windowProc;
         wc.hInstance = instance;
         wc.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));
-        wc.hIcon = LoadIconW(nullptr, MAKEINTRESOURCEW(32512));
+        wc.hIcon = appIcon(instance);
         wc.lpszClassName = L"NiKAudioTrayWindow";
         if (!RegisterClassW(&wc)) return;
 
@@ -187,6 +187,11 @@ private:
         }
     }
 
+    static HICON appIcon(HINSTANCE instance) {
+        if (const HICON icon = LoadIconW(instance, MAKEINTRESOURCEW(IDI_NIKAUDIO))) return icon;
+        return LoadIconW(nullptr, MAKEINTRESOURCEW(32512));
+    }
+
     bool updateIcon(HWND window, DWORD action) {
         NOTIFYICONDATAW icon{};
         icon.cbSize = sizeof(icon);
@@ -194,7 +199,7 @@ private:
         icon.uID = 1;
         icon.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
         icon.uCallbackMessage = trayMessage;
-        icon.hIcon = LoadIconW(nullptr, MAKEINTRESOURCEW(32512));
+        icon.hIcon = appIcon(GetModuleHandleW(nullptr));
         const std::wstring tip = L"NiKAudio | " + visibleStatus_;
         wcsncpy_s(icon.szTip, _countof(icon.szTip), tip.c_str(), _TRUNCATE);
         return Shell_NotifyIconW(action, &icon) != FALSE;
