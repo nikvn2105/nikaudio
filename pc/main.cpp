@@ -27,6 +27,7 @@
 #include "lan_auth.h"
 #include "latency_pulse.h"
 #include "tray.h"
+#include "stereo_mix.h"
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "iphlpapi.lib")
@@ -629,66 +630,6 @@ public:
 
 // MARK: - Main: WASAPI Loopback (Auto-Recover) -> 48kHz Stereo Int16 -> DualTransport
 
-struct StereoGain {
-    float left;
-    float right;
-};
-
-static std::vector<StereoGain> stereoGains(unsigned channels, DWORD mask) {
-    if (channels == 1) return {{1.0f, 1.0f}};
-    if (channels == 2) return {{1.0f, 0.0f}, {0.0f, 1.0f}};
-
-    // Extensible PCM orders its channels by ascending speaker bit.
-    unsigned maskChannels = 0;
-    for (DWORD bits = mask; bits != 0; bits &= bits - 1) ++maskChannels;
-    if (maskChannels != channels) {
-        if (channels == 6) mask = KSAUDIO_SPEAKER_5POINT1;
-        else if (channels == 8) mask = KSAUDIO_SPEAKER_7POINT1_SURROUND;
-        else mask = SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT;
-    }
-
-    constexpr float surroundGain = 0.70710678f;
-    std::vector<StereoGain> gains(channels);
-    unsigned channel = 0;
-    float leftSum = 0.0f;
-    float rightSum = 0.0f;
-    for (; mask != 0 && channel < channels; ++channel) {
-        const DWORD speaker = mask & (0u - mask);
-        mask &= mask - 1;
-        auto& gain = gains[channel];
-        switch (speaker) {
-        case SPEAKER_FRONT_LEFT:  gain = {1.0f, 0.0f}; break;
-        case SPEAKER_FRONT_RIGHT: gain = {0.0f, 1.0f}; break;
-        case SPEAKER_BACK_LEFT:
-        case SPEAKER_SIDE_LEFT:
-        case SPEAKER_FRONT_LEFT_OF_CENTER:
-        case SPEAKER_TOP_FRONT_LEFT:
-        case SPEAKER_TOP_BACK_LEFT: gain = {surroundGain, 0.0f}; break;
-        case SPEAKER_BACK_RIGHT:
-        case SPEAKER_SIDE_RIGHT:
-        case SPEAKER_FRONT_RIGHT_OF_CENTER:
-        case SPEAKER_TOP_FRONT_RIGHT:
-        case SPEAKER_TOP_BACK_RIGHT: gain = {0.0f, surroundGain}; break;
-        case SPEAKER_LOW_FREQUENCY: break;
-        default: gain = {surroundGain, surroundGain}; break;
-        }
-        leftSum += gain.left;
-        rightSum += gain.right;
-    }
-    const float peakGain = std::max(1.0f, std::max(leftSum, rightSum));
-    for (auto& gain : gains) {
-        gain.left /= peakGain;
-        gain.right /= peakGain;
-    }
-    return gains;
-}
-
-static inline int16_t floatToInt16(float v) {
-    if (v > 1.0f) v = 1.0f;
-    if (v < -1.0f) v = -1.0f;
-    return static_cast<int16_t>(v * 32767.0f);
-}
-
 int main(int argc, char* argv[]) {
     std::cout << "=== NiKAudio PC Sender (USB Lightning + Wi-Fi LAN) ===\n";
     std::cout << "Cach dung: NiKAudioPC.exe [IP_iPhone_tuy_chon]\n";
@@ -796,6 +737,7 @@ int main(int argc, char* argv[]) {
                 continue;
             }
             const auto gains = stereoGains(inChannels, channelMask);
+            StereoLimiter limiter(inChannels > 2);
             std::cout << "\n[WASAPI] Bat am thanh he thong: " << inRate << " Hz, "
                       << inChannels << " kenh, " << (isFloat ? "Float" : "PCM") << mixFmt->wBitsPerSample << "\n";
 
@@ -822,6 +764,7 @@ int main(int argc, char* argv[]) {
             double resampleStep = static_cast<double>(inRate) / static_cast<double>(OUT_SAMPLE_RATE);
             double resamplePos = 0.0;
             float prevL = 0.0f, prevR = 0.0f;
+            bool prevSurround = false;
 
             while (!tray.quitting) {
                 if (!tray.enabled) break;
@@ -853,6 +796,7 @@ int main(int argc, char* argv[]) {
                         }
 
                         std::vector<float> stereoIn(framesAvailable * 2, 0.0f);
+                        std::vector<uint8_t> surroundIn(inChannels > 2 ? framesAvailable : 0, 0);
                         if (!(flags & AUDCLNT_BUFFERFLAGS_SILENT) && data != nullptr) {
                             for (UINT32 i = 0; i < framesAvailable; ++i) {
                                 float left = 0.0f;
@@ -870,6 +814,11 @@ int main(int argc, char* argv[]) {
                                                     sampleData, sampleBytes);
                                         sample = static_cast<float>(pcm) / 2147483648.0f;
                                     }
+                                    if (inChannels > 2 && sample != 0 &&
+                                        gains[channel].left != 1 && gains[channel].right != 1 &&
+                                        (gains[channel].left != 0 || gains[channel].right != 0)) {
+                                        surroundIn[i] = 1;
+                                    }
                                     left += sample * gains[channel].left;
                                     right += sample * gains[channel].right;
                                 }
@@ -882,8 +831,8 @@ int main(int argc, char* argv[]) {
 
                         if (inRate == OUT_SAMPLE_RATE) {
                             for (UINT32 i = 0; i < framesAvailable; ++i) {
-                                outQueue.push_back(floatToInt16(stereoIn[i * 2]));
-                                outQueue.push_back(floatToInt16(stereoIn[i * 2 + 1]));
+                                limiter.append(stereoIn[i * 2], stereoIn[i * 2 + 1],
+                                               inChannels > 2 && surroundIn[i], outQueue);
                             }
                         } else {
                             while (resamplePos < static_cast<double>(framesAvailable)) {
@@ -893,14 +842,17 @@ int main(int argc, char* argv[]) {
                                 float r0 = (idx == 0) ? prevR : stereoIn[(idx - 1) * 2 + 1];
                                 float l1 = stereoIn[idx * 2];
                                 float r1 = stereoIn[idx * 2 + 1];
-                                outQueue.push_back(floatToInt16(l0 + (l1 - l0) * frac));
-                                outQueue.push_back(floatToInt16(r0 + (r1 - r0) * frac));
+                                const bool mixed = inChannels > 2 &&
+                                    ((idx == 0 ? prevSurround : surroundIn[idx - 1]) ||
+                                     (frac > 0 && surroundIn[idx]));
+                                limiter.append(l0 + (l1 - l0) * frac, r0 + (r1 - r0) * frac, mixed, outQueue);
                                 resamplePos += resampleStep;
                             }
                             resamplePos -= static_cast<double>(framesAvailable);
                             if (framesAvailable > 0) {
                                 prevL = stereoIn[(framesAvailable - 1) * 2];
                                 prevR = stereoIn[(framesAvailable - 1) * 2 + 1];
+                                prevSurround = inChannels > 2 && surroundIn.back();
                             }
                         }
 

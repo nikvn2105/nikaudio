@@ -28,6 +28,12 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           .\NiKAudioLanTest.exe
 
+      - name: Verify stereo downmix and limiter
+        run: |
+          cl /nologo /O2 /EHsc /std:c++17 /MT /W3 tests\stereo_mix.cpp /Fe:NiKAudioStereoTest.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\NiKAudioStereoTest.exe
+
       - name: Upload Windows EXE
         uses: actions/upload-artifact@v4
         with:
