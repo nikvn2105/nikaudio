@@ -7,7 +7,7 @@
 
 namespace GlassWindow {
 constexpr int width = 560;
-constexpr int height = 400;
+constexpr int height = 455;
 
 inline void roundedPath(Gdiplus::GraphicsPath& path, Gdiplus::RectF bounds, float radius) {
     const float diameter = radius * 2;

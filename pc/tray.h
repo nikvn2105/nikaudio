@@ -12,9 +12,11 @@ public:
     using Status = std::function<std::wstring()>;
     using Pair = std::function<bool(const PairingKey&)>;
     using Forget = std::function<bool()>;
+    using ReceiveUSBKey = std::function<bool(PairingKey&)>;
 
-    Tray(Status status, Pair pair, Forget forget)
-        : status_(std::move(status)), pair_(std::move(pair)), forget_(std::move(forget)) {
+    Tray(Status status, Pair pair, Forget forget, ReceiveUSBKey receiveUSBKey)
+        : status_(std::move(status)), pair_(std::move(pair)), forget_(std::move(forget)),
+          receiveUSBKey_(std::move(receiveUSBKey)) {
         worker_ = std::thread(&Tray::run, this);
     }
 
@@ -22,6 +24,8 @@ public:
         closing_ = true;
         if (const HWND window = window_.load()) PostMessageW(window, WM_CLOSE, 0, 0);
         if (worker_.joinable()) worker_.join();
+        if (usbWorker_.joinable()) usbWorker_.join();
+        SecureZeroMemory(pendingKey_.data(), pendingKey_.size());
     }
 
     std::atomic<bool> enabled{true};
@@ -29,7 +33,8 @@ public:
 
 private:
     static constexpr UINT trayMessage = WM_APP + 1;
-    enum Menu { toggle = 100, pair, forget, pulse, stopPulse, console, quit, open };
+    static constexpr UINT usbPairingResult = WM_APP + 2;
+    enum Menu { toggle = 100, pair, forget, pulse, stopPulse, console, quit, open, pairUSB };
 
     static LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
         if (message == WM_NCCREATE) {
@@ -42,6 +47,9 @@ private:
         case trayMessage:
             if (lParam == WM_LBUTTONUP) tray->showWindow(window);
             if (lParam == WM_RBUTTONUP) tray->showMenu(window);
+            return 0;
+        case usbPairingResult:
+            tray->finishUSBPairing(window, wParam != 0);
             return 0;
         case WM_TIMER:
             tray->refresh(window);
@@ -144,6 +152,7 @@ private:
         createButton(window, pulse, L"Đo độ trễ", 288, 269, 248, 44);
         createButton(window, stopPulse, L"Dừng tín hiệu thử", 24, 325, 248, 44);
         createButton(window, quit, L"Thoát NiKAudio", 288, 325, 248, 44);
+        createButton(window, pairUSB, L"Ghép đôi qua USB", 24, 381, 512, 44);
 
         DWORD consoleProcesses[2]{};
         ownsConsole_ = GetConsoleProcessList(consoleProcesses, 2) == 1;
@@ -208,6 +217,7 @@ private:
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(menu, MF_STRING, toggle, enabled ? L"Pause streaming" : L"Resume streaming");
         AppendMenuW(menu, MF_STRING, pair, L"Pair using key from clipboard");
+        AppendMenuW(menu, MF_STRING | (usbPairingInProgress_ ? MF_GRAYED : MF_ENABLED), pairUSB, L"Ghép đôi qua USB");
         AppendMenuW(menu, MF_STRING, forget, L"Forget paired iPhone");
         AppendMenuW(menu, enabled ? MF_STRING : MF_STRING | MF_GRAYED, pulse, L"Play latency test pulses");
         AppendMenuW(menu, MF_STRING, stopPulse, L"Stop latency test");
@@ -235,6 +245,7 @@ private:
             updateIcon(window, NIM_MODIFY);
             break;
         case pair: importKey(window); break;
+        case pairUSB: beginUSBPairing(window); break;
         case forget:
             if (MessageBoxW(window, L"Forget the saved LAN pairing key?", L"NiKAudio",
                             MB_YESNO | MB_ICONQUESTION) == IDYES && !forget_()) {
@@ -255,6 +266,35 @@ private:
             break;
         case quit: DestroyWindow(window); break;
         }
+    }
+
+    void beginUSBPairing(HWND window) {
+        if (usbPairingInProgress_) return;
+        usbPairingInProgress_ = true;
+        EnableWindow(GetDlgItem(window, pairUSB), FALSE);
+        usbWorker_ = std::thread([this, window] {
+            const bool received = receiveUSBKey_(pendingKey_);
+            PostMessageW(window, usbPairingResult, received, 0);
+        });
+    }
+
+    void finishUSBPairing(HWND window, bool received) {
+        if (usbWorker_.joinable()) usbWorker_.join();
+        if (!received) {
+            MessageBoxW(window, L"Cắm cáp vào PC của bạn, bật nhận âm thanh và chọn Gửi khóa qua cáp trên iPhone.",
+                        L"NiKAudio", MB_OK | MB_ICONWARNING);
+        } else if (MessageBoxW(window, L"Đã nhận khóa qua cáp. Bạn có muốn lưu khóa Wi-Fi của iPhone này?",
+                               L"NiKAudio", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES) {
+            if (pair_(pendingKey_)) {
+                MessageBoxW(window, L"Đã lưu khóa ghép đôi Wi-Fi.", L"NiKAudio", MB_OK | MB_ICONINFORMATION);
+            } else {
+                MessageBoxW(window, L"Không lưu được khóa ghép đôi.", L"NiKAudio", MB_OK | MB_ICONWARNING);
+            }
+        }
+        SecureZeroMemory(pendingKey_.data(), pendingKey_.size());
+        usbPairingInProgress_ = false;
+        EnableWindow(GetDlgItem(window, pairUSB), TRUE);
+        refresh(window);
     }
 
     void importKey(HWND window) {
@@ -278,13 +318,20 @@ private:
         if (!parsed || !pair_(key)) {
             MessageBoxW(window, L"Copy the pairing key from NiKAudio on iPhone and try again.",
                         L"NiKAudio", MB_OK | MB_ICONWARNING);
+        } else {
+            MessageBoxW(window, L"Đã lưu khóa ghép đôi Wi-Fi.", L"NiKAudio", MB_OK | MB_ICONINFORMATION);
         }
         SecureZeroMemory(key.data(), key.size());
+        refresh(window);
     }
 
     Status status_;
     Pair pair_;
     Forget forget_;
+    ReceiveUSBKey receiveUSBKey_;
+    PairingKey pendingKey_{};
+    std::thread usbWorker_;
+    bool usbPairingInProgress_ = false;
     UINT taskbarCreated_{0};
     bool ownsConsole_{false};
     bool iconVisible_{false};

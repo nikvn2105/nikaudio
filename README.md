@@ -14,9 +14,9 @@ Bản Windows và iOS có ghép đôi phải được cập nhật cùng nhau đ
 
 ## Tinh chỉnh và chẩn đoán
 
-- **Độ trễ thấp** đặt mức đệm 12 ms. **Ổn định** đặt 30 ms. Nếu LAN bị hụt khi có luồng âm thanh, ứng dụng tăng mức đệm theo bước 5 ms và giảm dần sau khi ổn định.
+- **Độ trễ thấp** đặt mục tiêu 12 ms. Khi đang nhận, mục **Chất lượng phát** hiển thị mức đệm thực tế sau khi tính số frame mỗi lần iOS yêu cầu. **Ổn định** đặt 30 ms. Nếu LAN bị hụt khi có luồng âm thanh, ứng dụng tăng mức đệm theo bước 5 ms và giảm dần sau khi ổn định.
 - Mở **Chẩn đoán** trên iPhone để xem mức đệm đang áp dụng, số lần hụt đệm, gói thiếu, gói muộn và thời gian giữa hai gói âm thanh được chấp nhận khi đổi đường truyền. Khoảng cách gói là chỉ số mạng. Độ ngắt nghe được còn phụ thuộc dữ liệu đang có trong bộ đệm.
-- Khi PC đang im tiếng, heartbeat giữ trạng thái kết nối. **Pause streaming** trong khay Windows dừng gửi, và **Resume streaming** mở lại đầu vào WASAPI.
+- Khi PC đang im tiếng, heartbeat giữ trạng thái kết nối. **Pause streaming** trong khay Windows dừng gửi PCM và giữ heartbeat, và **Resume streaming** mở lại đầu vào WASAPI.
 
 ## Đo độ trễ trên thiết bị thật
 
@@ -28,3 +28,10 @@ Bản Windows và iOS có ghép đôi phải được cập nhật cùng nhau đ
 ## Phông chữ
 
 Giao diện Windows và iPhone dùng chung Be Vietnam Pro, được nhúng trong ứng dụng theo giấy phép [SIL Open Font License](assets/fonts/OFL.txt).
+
+## Khôi phục âm thanh và ghép đôi qua USB
+
+- Chọn **Khôi phục âm thanh** nếu iPhone báo gián đoạn hoặc khôi phục tự động thất bại. Khi quay lại ứng dụng, NiKAudio thử mở lại engine nếu phiên nhận vẫn bật và engine đã dừng.
+- Ghép đôi qua cáp bằng cách bật nhận âm thanh, cắm vào PC của bạn, mở **Ghép đôi Wi-Fi** và xác nhận **Gửi khóa qua cáp**. Trong 30 giây, chọn **Ghép đôi qua USB** trên PC và xác nhận lưu khóa. Cách dán clipboard vẫn có ở cửa sổ và khay.
+- Heartbeat và gói đầu tiên sau khi WASAPI thu lại đánh dấu khoảng im ở PC. Nếu audio quay lại sau khi cạn bộ đệm mà chưa có một trong hai dấu này, NiKAudio tính một lần hụt và tăng mức đệm LAN. Tốc độ đọc bộ đệm thay đổi tối đa ±0,1% để bù lệch đồng hồ.
+- Endpoint Windows 5.1/7.1 giữ gain kênh trước và giới hạn đỉnh khi có tín hiệu surround trộn vào ở khoảng −1 dBFS. Endpoint mono/stereo giữ đường chuyển đổi PCM hiện tại.
