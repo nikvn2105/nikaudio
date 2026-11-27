@@ -45,17 +45,8 @@ Giao diện Windows và iPhone dùng chung Be Vietnam Pro, được nhúng trong
 
 Tệp đi qua kết nối TCP riêng dùng AES-256-GCM với khóa phiên theo từng hướng, xác thực từ khóa ghép đôi. Một lượt truyền hoạt động tại một thời điểm. Không cần bật nhận âm thanh để chép tệp.
 
-## Chiếu màn hình iPhone
-
-Công cụ sideload cần ký cả ứng dụng và Broadcast Upload Extension với cùng App Group `group.com.nikvn2105.nikaudio`. Nếu công cụ đổi bundle ID, đích của bộ chọn ReplayKit và App Group phải khớp cấu hình sau khi ký.
-
-1. Kết nối cùng LAN và ghép đôi. Trên Windows, bấm **Xem màn hình iPhone** để mở trình xem cục bộ bằng Edge hoặc Chrome có WebCodecs H.264.
-2. Trên iPhone, mở **Màn hình**, bấm **Chuẩn bị PC nhận màn hình**, rồi mở bộ chọn ReplayKit và chọn **Bắt đầu phát**. Dừng chia sẻ trong Trung tâm điều khiển. Nút **Dừng xem** trên PC đóng luồng trình duyệt và người dùng vẫn có thể xem lại.
-3. ReplayKit chỉ chuyển mẫu hình ảnh sang bộ mã hóa H.264 tối đa 720p/30 fps. Video được xác thực và mã hóa trên LAN (TCP 55125). Trình xem HTTP chỉ lắng nghe loopback (TCP 55126).
-
 ## Thử trên thiết bị thật
 
 - Truyền tệp 1 GB và 5 GB theo hai chiều, ngắt Wi-Fi giữa chừng rồi thử lại, đối chiếu SHA-256 và số bản tệp.
 - Đổi IP PC trên cùng LAN và thử tìm lại từ tab **Tệp**. Trên Windows, mục **Mở thư mục tệp nhận** nằm trong menu khay.
-- Trong lúc âm thanh LAN đang chạy, truyền thêm tệp và chiếu màn hình. Ghi tốc độ, số lần hụt đệm và độ trễ hình thực tế. Khi có audio LAN, tải xuống từ Windows giới hạn khoảng 8 MiB/s; iPhone giảm tải tệp xuống khoảng 2 MiB/s trong 8 giây sau khi xác nhận hụt đệm.
-- Xác nhận ReplayKit giữ được chữ ký/App Group sau sideload. Thử bắt đầu, dừng, đổi hướng màn hình và rớt/nối lại Wi-Fi.
+- Trong lúc âm thanh LAN đang chạy, truyền thêm tệp. Ghi tốc độ và số lần hụt đệm. Khi có audio LAN, tải xuống từ Windows giới hạn khoảng 8 MiB/s; iPhone giảm tải tệp xuống khoảng 2 MiB/s trong 8 giây sau khi xác nhận hụt đệm.

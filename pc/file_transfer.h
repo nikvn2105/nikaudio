@@ -112,11 +112,11 @@ struct Offer {
 // A challenge from each peer binds both directional AES-GCM keys to one TCP connection.
 class Channel {
 public:
-    Channel(SOCKET socket, const PairingKey& key, const char* magic = "NIKF") : socket_(socket) {
+    Channel(SOCKET socket, const PairingKey& key) : socket_(socket) {
         Bytes transcript{'N','I','K','F',1};
         transcript.resize(37);
         receiveRaw(transcript.data(), 21);
-        require(std::memcmp(transcript.data(), magic, 4) == 0 && transcript[4] == 1, "Unsupported file protocol");
+        require(std::memcmp(transcript.data(), "NIKF", 4) == 0 && transcript[4] == 1, "Unsupported file protocol");
         require(BCryptGenRandom(nullptr, transcript.data() + 21, 16, BCRYPT_USE_SYSTEM_PREFERRED_RNG) == 0,
                 "Cannot generate challenge");
         auto derive = [&](uint8_t label) -> LanTag {

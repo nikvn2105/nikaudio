@@ -15,9 +15,9 @@ public:
     using Forget = std::function<bool()>;
     using ReceiveUSBKey = std::function<bool(PairingKey&)>;
 
-    Tray(Status status, Pair pair, Forget forget, ReceiveUSBKey receiveUSBKey, FileTransfer::Server& files, ScreenReceiver::Server& screen)
+    Tray(Status status, Pair pair, Forget forget, ReceiveUSBKey receiveUSBKey, FileTransfer::Server& files)
         : status_(std::move(status)), pair_(std::move(pair)), forget_(std::move(forget)),
-          receiveUSBKey_(std::move(receiveUSBKey)), files_(files), screen_(screen) {
+          receiveUSBKey_(std::move(receiveUSBKey)), files_(files) {
         worker_ = std::thread(&Tray::run, this);
     }
 
@@ -35,7 +35,7 @@ public:
 private:
     static constexpr UINT trayMessage = WM_APP + 1;
     static constexpr UINT usbPairingResult = WM_APP + 2;
-    enum Menu { toggle = 100, pair, forget, pulse, stopPulse, console, quit, open, pairUSB, chooseFile, openDownloads, openScreen };
+    enum Menu { toggle = 100, pair, forget, pulse, stopPulse, console, quit, open, pairUSB, chooseFile, openDownloads };
 
     static LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
         if (message == WM_NCCREATE) {
@@ -171,8 +171,7 @@ private:
         createButton(window, pulse, L"Đo độ trễ", 288, 269, 248, 44);
         createButton(window, stopPulse, L"Dừng tín hiệu thử", 24, 325, 248, 44);
         createButton(window, quit, L"Thoát NiKAudio", 288, 325, 248, 44);
-        createButton(window, pairUSB, L"Ghép đôi qua USB", 24, 381, 248, 44);
-        createButton(window, openScreen, L"Xem màn hình iPhone", 288, 381, 248, 44);
+        createButton(window, pairUSB, L"Ghép đôi qua USB", 24, 381, 512, 44);
         createButton(window, chooseFile, L"Chọn tệp để gửi", 292, 510, 222, 40);
         const auto& address = files_.address();
         fileAddress_ = address.empty() ? L"Xem địa chỉ IPv4 trong cài đặt mạng Windows" : L"IP máy tính: " + address;
@@ -250,7 +249,6 @@ private:
         AppendMenuW(menu, MF_STRING, open, L"Open NiKAudio");
         AppendMenuW(menu, MF_STRING, chooseFile, L"Choose a file to send");
         AppendMenuW(menu, MF_STRING, openDownloads, L"Mở thư mục tệp nhận");
-        AppendMenuW(menu, MF_STRING, openScreen, L"Xem màn hình iPhone");
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(menu, MF_STRING, toggle, enabled ? L"Pause streaming" : L"Resume streaming");
         AppendMenuW(menu, MF_STRING, pair, L"Pair using key from clipboard");
@@ -274,10 +272,6 @@ private:
         switch (choice) {
         case open: showWindow(window); break;
         case chooseFile: chooseOutgoing(window); break;
-        case openScreen:
-            if (!screen_.open(window)) MessageBoxW(window, L"Không mở được trình xem màn hình.",
-                                                    L"NiKAudio", MB_OK | MB_ICONWARNING);
-            break;
         case openDownloads:
             try {
                 const auto folder = FileTransfer::targetFolder();
@@ -400,7 +394,6 @@ private:
     std::thread usbWorker_;
     bool usbPairingInProgress_ = false;
     FileTransfer::Server& files_;
-    ScreenReceiver::Server& screen_;
     UINT taskbarCreated_{0};
     bool ownsConsole_{false};
     bool iconVisible_{false};

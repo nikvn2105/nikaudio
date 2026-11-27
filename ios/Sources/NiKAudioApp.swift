@@ -766,8 +766,6 @@ struct NiKAudioApp: App {
                     .tabItem { Label("Âm thanh", systemImage: "waveform") }
                 FileTransferView()
                     .tabItem { Label("Tệp", systemImage: "folder") }
-                ScreenProbeView()
-                    .tabItem { Label("Màn hình", systemImage: "iphone.gen3") }
             }
             .tint(GlassTheme.mint)
             .preferredColorScheme(.dark)

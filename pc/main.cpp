@@ -89,7 +89,6 @@ static bool recvAll(SOCKET s, char* data, int len) {
 }
 
 #include "file_transfer.h"
-#include "screen_receiver.h"
 #include "tray.h"
 
 // MARK: - Windows usbmuxd Client (127.0.0.1:27015)
@@ -715,10 +714,9 @@ int main(int argc, char* argv[]) {
     {
         DualTransport transport(manualIP);
         FileTransfer::Server files(localFileAddresses(), [&] { return transport.audioOnLAN(); });
-        ScreenReceiver::Server screen;
         Tray tray([&] { return transport.windowStatus(); },
                   [&](const PairingKey& key) { return transport.pair(key); },
-                  [&] { return transport.forgetPairing(); }, readUSBPairingKey, files, screen);
+                  [&] { return transport.forgetPairing(); }, readUSBPairingKey, files);
         auto lastLog = std::chrono::steady_clock::now();
 
         while (!tray.quitting) {

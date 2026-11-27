@@ -22,7 +22,6 @@ final class FileChannel {
     private let connection: NWConnection
     private let queue = DispatchQueue(label: "NiKAudio.file-transfer")
     private let pairingKey: SymmetricKey
-    private let magic: String
     private let operationTimeout: TimeInterval
     private let maxRecord = 256 * 1024 + 1
     private var sender: SymmetricKey?
@@ -30,13 +29,11 @@ final class FileChannel {
     private var sendCounter: UInt32 = 0
     private var receiveCounter: UInt32 = 0
 
-    init(endpoint: NWEndpoint, pairingKey: Data, magic: String = "NIKF",
-         timeout: TimeInterval = 30, background: Bool = true) {
+    init(endpoint: NWEndpoint, pairingKey: Data, timeout: TimeInterval = 30) {
         self.pairingKey = SymmetricKey(data: pairingKey)
-        self.magic = magic
         operationTimeout = timeout
         let params = NWParameters.tcp
-        if background { params.serviceClass = .background }
+        params.serviceClass = .background
         connection = NWConnection(to: endpoint, using: params)
         connection.start(queue: queue)
     }
@@ -55,7 +52,7 @@ final class FileChannel {
             SecRandomCopyBytes(kSecRandomDefault, 16, bytes.baseAddress!)
         }
         guard status == errSecSuccess else { throw FileTransferError.invalidReply }
-        let hello = Data(magic.utf8) + Data([1]) + nonce
+        let hello = Data("NIKF".utf8) + Data([1]) + nonce
         try await write(hello)
         let reply = try await read(count: 48)
         let transcript = hello + reply.prefix(16)

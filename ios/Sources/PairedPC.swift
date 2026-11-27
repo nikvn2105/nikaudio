@@ -3,7 +3,6 @@ import Network
 
 enum PairedPC {
     static let fileService = "_nikaudio._tcp"
-    static let screenService = "_nikscreen._tcp"
 
     struct Destination: Sendable {
         let endpoint: NWEndpoint
