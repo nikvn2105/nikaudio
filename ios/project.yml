@@ -32,7 +32,7 @@ targets:
           - BeVietnamPro-Bold.ttf
         UIBackgroundModes:
           - audio
-        NSLocalNetworkUsageDescription: "NiKAudio can truy cap mang noi bo de nhan am thanh tu PC."
+        NSLocalNetworkUsageDescription: "NiKAudio cần truy cập mạng nội bộ để phát âm thanh và truyền tệp với PC."
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: false
         UILaunchScreen: {}

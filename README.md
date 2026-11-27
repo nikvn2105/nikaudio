@@ -35,3 +35,12 @@ Giao diện Windows và iPhone dùng chung Be Vietnam Pro, được nhúng trong
 - Ghép đôi qua cáp bằng cách bật nhận âm thanh, cắm vào PC của bạn, mở **Ghép đôi Wi-Fi** và xác nhận **Gửi khóa qua cáp**. Trong 30 giây, chọn **Ghép đôi qua USB** trên PC và xác nhận lưu khóa. Cách dán clipboard vẫn có ở cửa sổ và khay.
 - Heartbeat và gói đầu tiên sau khi WASAPI thu lại đánh dấu khoảng im ở PC. Nếu audio quay lại sau khi cạn bộ đệm mà chưa có một trong hai dấu này, NiKAudio tính một lần hụt và tăng mức đệm LAN. Tốc độ đọc bộ đệm thay đổi tối đa ±0,1% để bù lệch đồng hồ.
 - Endpoint Windows 5.1/7.1 giữ gain kênh trước và giới hạn đỉnh khi có tín hiệu surround trộn vào ở khoảng −1 dBFS. Endpoint mono/stereo giữ đường chuyển đổi PCM hiện tại.
+
+## Truyền tệp qua Wi-Fi
+
+1. Ghép đôi NiKAudio trên hai thiết bị và cho phép ứng dụng Windows truy cập mạng riêng khi Windows Firewall hỏi. Điện thoại và PC cần cùng LAN. Cổng truyền tệp là TCP 55124.
+2. Trên iPhone, vào **Tệp** và nhập IP được hiển thị ở mục **Truyền tệp LAN** trên PC.
+3. Để gửi sang PC, bấm **Chọn tệp từ iPhone**. Windows lưu vào **Downloads/NiKAudio**. Để tải từ PC, kéo một tệp vào cửa sổ Windows hoặc bấm **Chọn tệp để gửi**, rồi bấm **Tải tệp đã chọn trên PC** trên điện thoại. Tệp đã nhận có thể xuất qua **Chia sẻ tệp đã nhận**.
+4. Nếu bị gián đoạn, chọn lại đúng tệp hoặc bấm tải lại. Đầu nhận tiếp tục từ dữ liệu đã lưu và kiểm tra SHA-256 toàn tệp trước khi công bố bản hoàn chỉnh.
+
+Tệp đi qua kết nối TCP riêng dùng AES-256-GCM với khóa phiên theo từng hướng, xác thực từ khóa ghép đôi. Một lượt truyền hoạt động tại một thời điểm. Không cần bật nhận âm thanh để chép tệp.

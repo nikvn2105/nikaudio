@@ -7,7 +7,7 @@
 
 namespace GlassWindow {
 constexpr int width = 560;
-constexpr int height = 455;
+constexpr int height = 590;
 
 inline void roundedPath(Gdiplus::GraphicsPath& path, Gdiplus::RectF bounds, float radius) {
     const float diameter = radius * 2;
@@ -105,10 +105,12 @@ inline void backdrop(Gdiplus::Graphics& graphics, bool contrast) {
         band(graphics, 104, 100, Color(67, 112, 218, 197));
         band(graphics, 450, 334, Color(72, 157, 129, 232));
         panel(graphics, RectF(24, 91, 512, 152), 22, Color(34, 210, 229, 254), Color(53, 222, 235, 252));
+        panel(graphics, RectF(24, 441, 512, 123), 22, Color(34, 210, 229, 254), Color(53, 222, 235, 252));
     }
 }
 
-inline void paint(HWND window, const Fonts& fonts, float scale, const std::wstring& status, bool paused) {
+inline void paint(HWND window, const Fonts& fonts, float scale, const std::wstring& status, bool paused,
+                  const std::wstring& fileStatus, const std::wstring& addresses) {
     PAINTSTRUCT paint{};
     HDC target = BeginPaint(window, &paint);
     RECT bounds{};
@@ -140,6 +142,9 @@ inline void paint(HWND window, const Fonts& fonts, float scale, const std::wstri
         graphics.FillEllipse(&dot, 46.0f, 124.0f, 8.0f, 8.0f);
         text(graphics, fonts, L"Âm thanh từ PC", RectF(64, 116, 440, 25), 15, secondary);
         text(graphics, fonts, status, RectF(46, 144, 466, 35), 25, foreground, true);
+        text(graphics, fonts, L"Truyền tệp LAN", RectF(46, 454, 445, 26), 17, foreground, true);
+        text(graphics, fonts, addresses, RectF(46, 480, 465, 24), 14, secondary);
+        text(graphics, fonts, fileStatus, RectF(46, 515, 236, 31), 13, foreground);
     }
     if (buffered) {
         BitBlt(target, 0, 0, bounds.right, bounds.bottom, buffer, 0, 0, SRCCOPY);

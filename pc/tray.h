@@ -1,6 +1,7 @@
 #pragma once
 
 #include <dwmapi.h>
+#include <commdlg.h>
 #include <shellapi.h>
 #include <functional>
 #include <utility>
@@ -14,9 +15,9 @@ public:
     using Forget = std::function<bool()>;
     using ReceiveUSBKey = std::function<bool(PairingKey&)>;
 
-    Tray(Status status, Pair pair, Forget forget, ReceiveUSBKey receiveUSBKey)
+    Tray(Status status, Pair pair, Forget forget, ReceiveUSBKey receiveUSBKey, FileTransfer::Server& files)
         : status_(std::move(status)), pair_(std::move(pair)), forget_(std::move(forget)),
-          receiveUSBKey_(std::move(receiveUSBKey)) {
+          receiveUSBKey_(std::move(receiveUSBKey)), files_(files) {
         worker_ = std::thread(&Tray::run, this);
     }
 
@@ -34,7 +35,7 @@ public:
 private:
     static constexpr UINT trayMessage = WM_APP + 1;
     static constexpr UINT usbPairingResult = WM_APP + 2;
-    enum Menu { toggle = 100, pair, forget, pulse, stopPulse, console, quit, open, pairUSB };
+    enum Menu { toggle = 100, pair, forget, pulse, stopPulse, console, quit, open, pairUSB, chooseFile };
 
     static LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
         if (message == WM_NCCREATE) {
@@ -70,8 +71,26 @@ private:
             }
             break;
         }
+        case WM_DROPFILES: {
+            const HDROP drop = reinterpret_cast<HDROP>(wParam);
+            const auto count = DragQueryFileW(drop, 0xffffffffu, nullptr, 0);
+            if (count == 1) {
+                const auto length = DragQueryFileW(drop, 0, nullptr, 0);
+                if (length > 0) {
+                    std::wstring path(length + 1, L'\0');
+                    if (DragQueryFileW(drop, 0, path.data(), static_cast<UINT>(path.size())) == length) {
+                        path.resize(length);
+                        tray->files_.offer(path);
+                        tray->refresh(window);
+                    }
+                }
+            }
+            DragFinish(drop);
+            return 0;
+        }
         case WM_PAINT:
-            GlassWindow::paint(window, *tray->fonts_, tray->scale_, tray->visibleStatus_, !tray->enabled);
+            GlassWindow::paint(window, *tray->fonts_, tray->scale_, tray->visibleStatus_, !tray->enabled,
+                               tray->fileStatus_, tray->fileAddress_);
             return 0;
         case WM_ERASEBKGND:
             return TRUE;
@@ -153,6 +172,10 @@ private:
         createButton(window, stopPulse, L"Dừng tín hiệu thử", 24, 325, 248, 44);
         createButton(window, quit, L"Thoát NiKAudio", 288, 325, 248, 44);
         createButton(window, pairUSB, L"Ghép đôi qua USB", 24, 381, 512, 44);
+        createButton(window, chooseFile, L"Chọn tệp để gửi", 292, 510, 222, 40);
+        const auto& address = files_.address();
+        fileAddress_ = address.empty() ? L"Xem địa chỉ IPv4 trong cài đặt mạng Windows" : L"IP máy tính: " + address;
+        DragAcceptFiles(window, TRUE);
 
         DWORD consoleProcesses[2]{};
         ownsConsole_ = GetConsoleProcessList(consoleProcesses, 2) == 1;
@@ -194,6 +217,11 @@ private:
             SetWindowTextW(window, (L"NiKAudio | " + status).c_str());
             InvalidateRect(window, nullptr, FALSE);
         }
+        const auto files = files_.status();
+        if (fileStatus_ != files) {
+            fileStatus_ = files;
+            InvalidateRect(window, nullptr, FALSE);
+        }
     }
 
     static HICON appIcon(HINSTANCE instance) {
@@ -219,6 +247,7 @@ private:
         if (!menu) return;
         AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, visibleStatus_.c_str());
         AppendMenuW(menu, MF_STRING, open, L"Open NiKAudio");
+        AppendMenuW(menu, MF_STRING, chooseFile, L"Choose a file to send");
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(menu, MF_STRING, toggle, enabled ? L"Pause streaming" : L"Resume streaming");
         AppendMenuW(menu, MF_STRING, pair, L"Pair using key from clipboard");
@@ -241,6 +270,7 @@ private:
     void perform(HWND window, UINT choice) {
         switch (choice) {
         case open: showWindow(window); break;
+        case chooseFile: chooseOutgoing(window); break;
         case toggle:
             enabled = !enabled;
             if (!enabled) PlaySoundW(nullptr, nullptr, 0);
@@ -302,6 +332,21 @@ private:
         refresh(window);
     }
 
+    void chooseOutgoing(HWND window) {
+        std::vector<wchar_t> file(32768);
+        OPENFILENAMEW dialog{};
+        dialog.lStructSize = sizeof(dialog);
+        dialog.hwndOwner = window;
+        dialog.lpstrFile = file.data();
+        dialog.nMaxFile = static_cast<DWORD>(file.size());
+        dialog.lpstrTitle = L"Chọn tệp để gửi sang iPhone";
+        dialog.Flags = OFN_NOCHANGEDIR | OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST;
+        if (GetOpenFileNameW(&dialog)) {
+            files_.offer(file.data());
+            refresh(window);
+        }
+    }
+
     void importKey(HWND window) {
         PairingKey key{};
         bool parsed = false;
@@ -337,12 +382,14 @@ private:
     PairingKey pendingKey_{};
     std::thread usbWorker_;
     bool usbPairingInProgress_ = false;
+    FileTransfer::Server& files_;
     UINT taskbarCreated_{0};
     bool ownsConsole_{false};
     bool iconVisible_{false};
     float scale_{1.0f};
     const GlassWindow::Fonts* fonts_{nullptr};
     std::wstring visibleStatus_;
+    std::wstring fileStatus_, fileAddress_;
     std::atomic<HWND> window_{nullptr};
     std::atomic<bool> closing_{false};
     std::thread worker_;
