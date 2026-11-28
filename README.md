@@ -41,8 +41,14 @@ Giao diện Windows và iPhone dùng chung Be Vietnam Pro, được nhúng trong
 ## Truyền tệp qua Wi-Fi
 
 1. Ghép đôi NiKAudio trên hai thiết bị và cho phép ứng dụng Windows truy cập mạng riêng khi Windows Firewall hỏi. Điện thoại và PC cần cùng LAN. Cổng truyền tệp là TCP 55124.
-2. Trên iPhone, vào **Tệp** và nhập IP được hiển thị ở mục **Truyền tệp LAN** trên PC.
+2. Trên iPhone, vào **Tệp** và để trống IP để tìm PC đã ghép đôi qua Bonjour. Có thể nhập IPv4 hiển thị ở mục **Truyền tệp LAN** trên PC nếu mạng chặn Bonjour.
 3. Để gửi sang PC, bấm **Chọn tệp từ iPhone**. Windows lưu vào **Downloads/NiKAudio**. Để tải từ PC, kéo một tệp vào cửa sổ Windows hoặc bấm **Chọn tệp để gửi**, rồi bấm **Tải tệp đã chọn trên PC** trên điện thoại. Tệp đã nhận có thể xuất qua **Chia sẻ tệp đã nhận**.
 4. Nếu bị gián đoạn, chọn lại đúng tệp hoặc bấm tải lại. Đầu nhận tiếp tục từ dữ liệu đã lưu và kiểm tra SHA-256 toàn tệp trước khi công bố bản hoàn chỉnh.
 
 Tệp đi qua kết nối TCP riêng dùng AES-256-GCM với khóa phiên theo từng hướng, xác thực từ khóa ghép đôi. Một lượt truyền hoạt động tại một thời điểm. Không cần bật nhận âm thanh để chép tệp.
+
+## Thử trên thiết bị thật
+
+- Truyền tệp 1 GB và 5 GB theo hai chiều, ngắt Wi-Fi giữa chừng rồi thử lại, đối chiếu SHA-256 và số bản tệp.
+- Đổi IP PC trên cùng LAN và thử tìm lại từ tab **Tệp**. Trên Windows, mục **Mở thư mục tệp nhận** nằm trong menu khay.
+- Trong lúc âm thanh LAN đang chạy, truyền thêm tệp. Ghi tốc độ và số lần hụt đệm. Khi có audio LAN, tải xuống từ Windows giới hạn khoảng 8 MiB/s; iPhone giảm tải tệp xuống khoảng 2 MiB/s trong 8 giây sau khi xác nhận hụt đệm.

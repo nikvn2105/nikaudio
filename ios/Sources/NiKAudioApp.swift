@@ -181,6 +181,7 @@ final class AudioReceiver: NSObject, ObservableObject {
     }
 
     func stop(message: String = "Đã dừng") {
+        BulkTraffic.shared.update(lanActive: false, underruns: 0)
         cancelUSBPairing()
         let sessionWasOpen = listenerSession != nil
         listenerSession = nil
@@ -727,6 +728,8 @@ final class AudioReceiver: NSObject, ObservableObject {
                     self.droppedPackets = dropped
                     self.bufferMs = diagnostics.bufferMs
                     self.effectiveTargetMs = diagnostics.targetMs
+                    BulkTraffic.shared.update(lanActive: currentMode == .lan && !idle,
+                                              underruns: diagnostics.underruns)
                     self.underruns = diagnostics.underruns
                     self.latePackets = late
                     self.lastHandoffMs = handoff

@@ -35,7 +35,7 @@ public:
 private:
     static constexpr UINT trayMessage = WM_APP + 1;
     static constexpr UINT usbPairingResult = WM_APP + 2;
-    enum Menu { toggle = 100, pair, forget, pulse, stopPulse, console, quit, open, pairUSB, chooseFile };
+    enum Menu { toggle = 100, pair, forget, pulse, stopPulse, console, quit, open, pairUSB, chooseFile, openDownloads };
 
     static LRESULT CALLBACK windowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
         if (message == WM_NCCREATE) {
@@ -248,6 +248,7 @@ private:
         AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, visibleStatus_.c_str());
         AppendMenuW(menu, MF_STRING, open, L"Open NiKAudio");
         AppendMenuW(menu, MF_STRING, chooseFile, L"Choose a file to send");
+        AppendMenuW(menu, MF_STRING, openDownloads, L"Mở thư mục tệp nhận");
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(menu, MF_STRING, toggle, enabled ? L"Pause streaming" : L"Resume streaming");
         AppendMenuW(menu, MF_STRING, pair, L"Pair using key from clipboard");
@@ -271,6 +272,16 @@ private:
         switch (choice) {
         case open: showWindow(window); break;
         case chooseFile: chooseOutgoing(window); break;
+        case openDownloads:
+            try {
+                const auto folder = FileTransfer::targetFolder();
+                std::filesystem::create_directories(folder);
+                if (reinterpret_cast<INT_PTR>(ShellExecuteW(window, L"open", folder.c_str(), nullptr, nullptr, SW_SHOWNORMAL)) <= 32)
+                    throw std::runtime_error("Cannot open folder");
+            } catch (...) {
+                MessageBoxW(window, L"Không mở được thư mục tệp nhận.", L"NiKAudio", MB_OK | MB_ICONWARNING);
+            }
+            break;
         case toggle:
             enabled = !enabled;
             if (!enabled) PlaySoundW(nullptr, nullptr, 0);

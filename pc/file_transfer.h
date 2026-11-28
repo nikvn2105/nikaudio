@@ -5,6 +5,7 @@
 #include <functional>
 #include <stdexcept>
 #include <shlobj.h>
+#include "bonjour_service.h"
 
 namespace FileTransfer {
 constexpr uint16_t port = 55124;
@@ -115,7 +116,7 @@ public:
         Bytes transcript{'N','I','K','F',1};
         transcript.resize(37);
         receiveRaw(transcript.data(), 21);
-        require(std::memcmp(transcript.data(), "NIKF\x01", 5) == 0, "Unsupported file protocol");
+        require(std::memcmp(transcript.data(), "NIKF", 4) == 0 && transcript[4] == 1, "Unsupported file protocol");
         require(BCryptGenRandom(nullptr, transcript.data() + 21, 16, BCRYPT_USE_SYSTEM_PREFERRED_RNG) == 0,
                 "Cannot generate challenge");
         auto derive = [&](uint8_t label) -> LanTag {
@@ -135,6 +136,8 @@ public:
         SecureZeroMemory(clientToServer.data(), clientToServer.size());
         SecureZeroMemory(serverToClient.data(), serverToClient.size());
     }
+
+    void authenticated() { authenticating_ = false; }
 
     void send(const Bytes& data) {
         require(!data.empty() && data.size() <= blockSize + 1 && sendCounter_ != UINT32_MAX, "Invalid data block");
@@ -176,10 +179,30 @@ private:
     }
 
     void receiveRaw(uint8_t* data, int size) {
-        require(recvAll(socket_, reinterpret_cast<char*>(data), size), "Connection interrupted");
+        if (!authenticating_) {
+            require(recvAll(socket_, reinterpret_cast<char*>(data), size), "Connection interrupted");
+            return;
+        }
+        while (size > 0) {
+            const auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(
+                authDeadline_ - std::chrono::steady_clock::now()).count();
+            require(remaining > 0, "Authentication timed out");
+            timeval wait{static_cast<long>(remaining / 1000000), static_cast<long>(remaining % 1000000)};
+            fd_set readSet;
+            FD_ZERO(&readSet);
+            FD_SET(socket_, &readSet);
+            require(select(0, &readSet, nullptr, nullptr, &wait) == 1, "Authentication timed out");
+            const int got = recv(socket_, reinterpret_cast<char*>(data), size, 0);
+            require(got > 0, "Connection interrupted");
+            data += got;
+            size -= got;
+        }
     }
 
     SOCKET socket_;
+    const std::chrono::steady_clock::time_point authDeadline_ =
+        std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    bool authenticating_ = true;
     LanAuthenticator auth;
     LanCipher sender_, receiver_;
     uint32_t sendCounter_ = 0, receiveCounter_ = 0;
@@ -220,7 +243,8 @@ inline std::wstring safeName(const std::string& name) {
 
 class Server {
 public:
-    explicit Server(std::wstring address) : address_(std::move(address)), worker_(&Server::run, this) {}
+    Server(std::wstring address, std::function<bool()> audioOnLAN)
+        : address_(std::move(address)), audioOnLAN_(std::move(audioOnLAN)), worker_(&Server::run, this) {}
 
     ~Server() {
         running_ = false;
@@ -239,7 +263,7 @@ public:
 
     std::wstring status() const {
         std::lock_guard<std::mutex> lock(mutex_);
-        return status_;
+        return peerAddress_.empty() ? status_ : peerAddress_ + L" · " + status_;
     }
 
     const std::wstring& address() const { return address_; }
@@ -275,6 +299,22 @@ private:
         const auto offer = Offer::decode(request);
         const auto destination = targetFolder();
         std::filesystem::create_directories(destination);
+        const auto filename = safeName(offer.name);
+        // File name + verified contents give a stable receipt even after restart or lost ACK.
+        for (unsigned i = 0; i < 10000; ++i) {
+            const Path final = destination / (i ? std::to_wstring(i) + L" - " + filename : filename);
+            if (!std::filesystem::exists(final)) break;
+            if (std::filesystem::is_regular_file(final) && std::filesystem::file_size(final) == offer.size &&
+                verifiedDigest(final, channel) == offer.digest) {
+                Bytes complete{3};
+                append(complete, offer.size);
+                channel.send(complete);
+                require(channel.receive() == Bytes{5}, "Transfer did not complete");
+                setStatus(L"Tệp đã có trong Downloads / NiKAudio");
+                channel.send({6});
+                return;
+            }
+        }
         const auto staging = partialFolder();
         std::filesystem::create_directories(staging);
         const auto partial = staging / (hex(offer.digest) + L".part");
@@ -305,7 +345,6 @@ private:
             throw std::runtime_error("File checksum mismatch; retry from the start");
         }
 
-        const auto filename = safeName(offer.name);
         bool saved = false;
         for (unsigned i = 0; i < 10000; ++i) {
             const Path final = destination / (i ? std::to_wstring(i) + L" - " + filename : filename);
@@ -348,7 +387,13 @@ private:
             const auto sizeToRead = static_cast<size_t>(std::min<uint64_t>(blockSize, offer.size - done));
             require(bool(file.read(reinterpret_cast<char*>(data.data() + 1), sizeToRead)), "File changed while sending");
             data.resize(sizeToRead + 1);
+            const auto sentAt = std::chrono::steady_clock::now();
             channel.send(data);
+            if (audioOnLAN_()) {
+                // Keep the bulk TCP queue shallow while the same path is carrying audio.
+                const auto budget = std::chrono::duration<double>(sizeToRead / (8.0 * 1048576));
+                std::this_thread::sleep_until(sentAt + budget);
+            }
             done += sizeToRead;
             progress(done, offer.size, start, offset);
         }
@@ -369,6 +414,16 @@ private:
             Channel channel(socket, key);
             SecureZeroMemory(key.data(), key.size());
             const auto req = channel.receive();
+            channel.authenticated();
+            if (req == Bytes{11}) { channel.send({12}); return; }
+            sockaddr_in peer{};
+            int peerLength = sizeof(peer);
+            char peerIP[INET_ADDRSTRLEN]{};
+            if (getpeername(socket, reinterpret_cast<sockaddr*>(&peer), &peerLength) == 0 &&
+                inet_ntop(AF_INET, &peer.sin_addr, peerIP, sizeof(peerIP))) {
+                std::lock_guard<std::mutex> lock(mutex_);
+                peerAddress_ = widen(peerIP);
+            }
             try {
                 if (req[0] == 1) upload(channel, req);
                 else if (req == Bytes{2}) download(channel);
@@ -404,6 +459,7 @@ private:
             closesocket(listener);
             return;
         }
+        publishBonjour(port, L"_nikaudio._tcp");
         while (running_) {
             fd_set readable;
             FD_ZERO(&readable);
@@ -430,10 +486,11 @@ private:
     mutable std::mutex mutex_;
     Path offered_;
     std::wstring status_ = L"Sẵn sàng nhận tệp";
-    std::wstring address_;
+    std::wstring address_, peerAddress_;
     std::mutex socketMutex_;
     SOCKET peer_ = INVALID_SOCKET;
     std::atomic<bool> running_{true};
+    std::function<bool()> audioOnLAN_;
     std::thread worker_;
 };
 }

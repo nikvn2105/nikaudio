@@ -3,6 +3,7 @@ import UniformTypeIdentifiers
 
 struct FileTransferView: View {
     @AppStorage("fileTransferPCAddress") private var address = ""
+    @AppStorage("pairedPCService") private var preferredPC = ""
     @State private var chooseFile = false
     @State private var active: Task<Void, Never>?
     @State private var state = "Kết nối cùng Wi-Fi và ghép đôi với PC trước khi truyền tệp."
@@ -15,13 +16,16 @@ struct FileTransferView: View {
                 Text("Truyền tệp").font(AppFont.bold(34, relativeTo: .largeTitle))
                     .accessibilityAddTraits(.isHeader)
                 VStack(alignment: .leading, spacing: 14) {
-                    Text("Địa chỉ IP của Windows").font(AppFont.bold(17, relativeTo: .headline))
-                    TextField("192.168.1.20", text: $address)
+                    Text("Máy tính Windows").font(AppFont.bold(17, relativeTo: .headline))
+                    TextField("Tự tìm PC hoặc nhập IPv4", text: $address)
                         .keyboardType(.numbersAndPunctuation)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                         .textFieldStyle(.roundedBorder)
                         .disabled(active != nil)
+                    if !preferredPC.isEmpty {
+                        Text(preferredPC).foregroundStyle(.secondary)
+                    }
                     Button { chooseFile = true } label: { Label("Chọn tệp từ iPhone", systemImage: "arrow.up.doc") }
                         .buttonStyle(.borderedProminent)
                         .tint(GlassTheme.mint)
@@ -72,6 +76,7 @@ struct FileTransferView: View {
             state = error.localizedDescription
             return
         }
+        let preferred = preferredPC
         received = nil
         progress = nil
         state = "Đang chuẩn bị truyền tệp…"
@@ -84,11 +89,15 @@ struct FileTransferView: View {
                         state = "Đang truyền tệp…"
                     }
                 }
+                let pc = try await PairedPC.find(address: host, preferred: preferred, key: key)
+                if let name = pc.name {
+                    await MainActor.run { preferredPC = name }
+                }
                 if let upload = upload {
-                    try await FileTransfer.upload(upload, address: host, key: key, progress: update)
+                    try await FileTransfer.upload(upload, endpoint: pc.endpoint, key: key, progress: update)
                     return Optional<URL>.none
                 }
-                return try await FileTransfer.download(address: host, key: key, progress: update)
+                return try await FileTransfer.download(endpoint: pc.endpoint, key: key, progress: update)
             }
             defer { active = nil }
             do {
