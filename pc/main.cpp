@@ -16,8 +16,10 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <iostream>
 #include <mutex>
 #include <string>
@@ -338,6 +340,10 @@ class DualTransport {
 public:
     explicit DualTransport(const std::string& manualIP) : manualLanIP_(manualIP) {
         udpSock_ = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (udpSock_ != INVALID_SOCKET) {
+            const DWORD timeout = 15;
+            setsockopt(udpSock_, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+        }
         discoverySock_ = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
         if (discoverySock_ != INVALID_SOCKET) {
             BOOL bcast = TRUE;
@@ -351,12 +357,16 @@ public:
 
         hasPairingKey_ = loadPairingKey(pairingKey_);
         monitorThread_ = std::thread(&DualTransport::monitorLoop, this);
-        heartbeatThread_ = std::thread(&DualTransport::heartbeatLoop, this);
+        senderThread_ = std::thread(&DualTransport::senderLoop, this);
     }
 
     ~DualTransport() {
-        running_ = false;
-        if (heartbeatThread_.joinable()) heartbeatThread_.join();
+        {
+            std::lock_guard<std::mutex> lock(queueMutex_);
+            running_ = false;
+        }
+        queueReady_.notify_one();
+        if (senderThread_.joinable()) senderThread_.join();
         if (monitorThread_.joinable()) monitorThread_.join();
         std::lock_guard<std::mutex> lk(mu_);
         if (usbSock_ != INVALID_SOCKET) closesocket(usbSock_);
@@ -365,8 +375,13 @@ public:
     }
 
     void setEnabled(bool enabled) {
-        std::lock_guard<std::mutex> lock(mu_);
-        enabled_ = enabled;
+        std::lock_guard<std::mutex> lock(queueMutex_);
+        if (enabled_.exchange(enabled) && !enabled) clearAudioQueue();
+    }
+
+    void discardQueuedAudio() {
+        std::lock_guard<std::mutex> lock(queueMutex_);
+        clearAudioQueue();
     }
 
     bool pair(const PairingKey& key) {
@@ -389,9 +404,22 @@ public:
         return true;
     }
 
-    void sendAudioPacket(const int16_t* pcmStereo, size_t frames, bool captureResumed) {
-        std::lock_guard<std::mutex> lock(mu_);
-        if (enabled_) sendPacket(pcmStereo, frames, captureResumed);
+    void queueAudioPacket(const int16_t* pcmStereo, bool captureResumed) {
+        {
+            std::lock_guard<std::mutex> lock(queueMutex_);
+            if (!enabled_) return;
+            if (captureResumed) clearAudioQueue();
+            if (audioQueue_.size() == maxQueuedAudio) {
+                audioQueue_.pop_front();
+                audioQueue_.front().captureResumed = true;
+            }
+            auto& packet = audioQueue_.emplace_back();
+            std::copy_n(pcmStereo, packet.pcm.size(), packet.pcm.begin());
+            packet.queuedAt = Clock::now();
+            packet.captureResumed = captureResumed;
+            packet.generation = audioGeneration_;
+        }
+        queueReady_.notify_one();
     }
 
     unsigned sequence() const { return seq_; }
@@ -404,7 +432,8 @@ public:
     }
 
     std::string statusText() {
-        std::lock_guard<std::mutex> lk(mu_);
+        std::unique_lock<std::mutex> lk(mu_, std::try_to_lock);
+        if (!lk.owns_lock()) return "Dang gui am thanh";
         if (usbSock_ != INVALID_SOCKET) {
             if (lanReady()) return "USB Lightning (LAN san sang: " + currentLanIP_ + ")";
             return "USB Lightning (usbmuxd)";
@@ -415,6 +444,21 @@ public:
 
 private:
     using Clock = std::chrono::steady_clock;
+    static constexpr size_t maxQueuedAudio = 8;
+    static constexpr auto maxAudioAge = std::chrono::milliseconds(20);
+
+    struct QueuedAudio {
+        std::array<int16_t, PACKET_FRAMES * 2> pcm;
+        Clock::time_point queuedAt;
+        bool captureResumed;
+        uint64_t generation;
+    };
+
+    // Called with queueMutex_ held. Invalidate a packet the sender dequeued before the reset.
+    void clearAudioQueue() {
+        audioQueue_.clear();
+        ++audioGeneration_;
+    }
 
     bool lanReady() const {
         return hasLanTarget_ && Clock::now() - lanConfirmed_ < std::chrono::seconds(12);
@@ -599,18 +643,49 @@ private:
         }
     }
 
-    void heartbeatLoop() {
-        while (running_) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(80));
+    void senderLoop() {
+        bool droppedAudio = false;
+        while (true) {
+            QueuedAudio packet{};
+            bool hasAudio;
+            {
+                std::unique_lock<std::mutex> lock(queueMutex_);
+                queueReady_.wait_for(lock, std::chrono::milliseconds(80), [this] {
+                    return !running_ || !audioQueue_.empty();
+                });
+                if (!running_) return;
+                const auto now = Clock::now();
+                while (!audioQueue_.empty() && now - audioQueue_.front().queuedAt >= maxAudioAge) {
+                    droppedAudio = true;
+                    audioQueue_.pop_front();
+                }
+                hasAudio = !audioQueue_.empty();
+                if (hasAudio) {
+                    packet = audioQueue_.front();
+                    audioQueue_.pop_front();
+                }
+            }
             std::lock_guard<std::mutex> lock(mu_);
-            if (running_ && Clock::now() - lastSent_ >= std::chrono::milliseconds(250)) {
-                sendPacket(nullptr, 0);
+            if (!running_) return;
+            const auto now = Clock::now();
+            if (hasAudio && now - packet.queuedAt < maxAudioAge) {
+                if (enabled_ && packet.generation == audioGeneration_) {
+                    sendPacket(packet.pcm.data(), PACKET_FRAMES, packet.captureResumed || droppedAudio);
+                }
+                droppedAudio = false;
+            } else {
+                droppedAudio = droppedAudio || hasAudio;
+                if (now - lastSent_ >= std::chrono::milliseconds(250)) sendPacket(nullptr, 0);
             }
         }
     }
 
     std::atomic<bool> running_{true};
     std::mutex mu_;
+    std::mutex queueMutex_;
+    std::condition_variable queueReady_;
+    std::deque<QueuedAudio> audioQueue_;
+    std::atomic<uint64_t> audioGeneration_{0};
     SOCKET usbSock_{INVALID_SOCKET};
     SOCKET udpSock_{INVALID_SOCKET};
     SOCKET discoverySock_{INVALID_SOCKET};
@@ -619,7 +694,7 @@ private:
     bool hasLanTarget_{false};
     std::atomic<uint32_t> seq_{0};
     uint32_t heartbeatSeq_{0};
-    bool enabled_{true};
+    std::atomic<bool> enabled_{true};
     LanAuthenticator auth_;
     LanCipher cipher_;
     PairingKey pairingKey_{};
@@ -632,7 +707,7 @@ private:
     std::string manualLanIP_;
     std::string currentLanIP_;
     std::thread monitorThread_;
-    std::thread heartbeatThread_;
+    std::thread senderThread_;
 };
 
 // MARK: - WASAPI Default Device Change Notifier
@@ -914,7 +989,7 @@ int main(int argc, char* argv[]) {
 
                         size_t offset = 0;
                         while (outQueue.size() - offset >= PACKET_FRAMES * 2) {
-                            transport.sendAudioPacket(outQueue.data() + offset, PACKET_FRAMES, markCaptureResumed);
+                            transport.queueAudioPacket(outQueue.data() + offset, markCaptureResumed);
                             markCaptureResumed = false;
                             offset += PACKET_FRAMES * 2;
                         }
@@ -939,6 +1014,7 @@ int main(int argc, char* argv[]) {
                 }
             }
 
+            transport.discardQueuedAudio();
             cleanupSession();
             Sleep(200);
         }

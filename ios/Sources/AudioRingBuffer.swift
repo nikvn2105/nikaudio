@@ -1,9 +1,45 @@
 import Foundation
 import Darwin
 
+struct AudioPacketReorder {
+    struct Packet {
+        let seq: UInt32
+        let payload: Data
+        let isUSB: Bool
+        let captureResumed: Bool
+    }
+
+    static let maxAhead: Int32 = 2
+    static let waitMs = 5
+    private var pending: [Packet] = []
+    var isEmpty: Bool { pending.isEmpty }
+
+    mutating func hold(_ packet: Packet, after lastSeq: UInt32) -> Bool {
+        let distance = Int32(bitPattern: packet.seq &- lastSeq)
+        guard (2...(Self.maxAhead + 1)).contains(distance) else { return false }
+        if !pending.contains(where: { $0.seq == packet.seq }) {
+            pending.append(packet)
+        }
+        return true
+    }
+
+    mutating func next(after lastSeq: UInt32, flush: Bool, before incomingSeq: UInt32? = nil) -> Packet? {
+        pending.removeAll { Int32(bitPattern: $0.seq &- lastSeq) <= 0 }
+        guard let index = pending.indices.min(by: { pending[$0].seq &- lastSeq < pending[$1].seq &- lastSeq }),
+              flush || pending[index].seq &- lastSeq == 1 else { return nil }
+        if let incomingSeq = incomingSeq, pending[index].seq &- lastSeq >= incomingSeq &- lastSeq {
+            return nil
+        }
+        return pending.remove(at: index)
+    }
+}
+
 // MARK: - UnfairLock Stereo Float Ring Buffer (48kHz)
 
 final class AudioRingBuffer {
+    static let defaultTargetMs = 20.0
+    static let targetRange: ClosedRange<Double> = 10...60
+
     private let capacityFrames: Int
     private let buffer: UnsafeMutablePointer<Float>
     private var readIndex: Int = 0
@@ -11,7 +47,7 @@ final class AudioRingBuffer {
     private var availableFrames: Int = 0
     private let lock: UnsafeMutablePointer<os_unfair_lock>
 
-    private var requestedFrames = 960 // 20ms @ 48kHz
+    private var requestedFrames = Int(AudioRingBuffer.defaultTargetMs * 48)
     private var adaptiveFrames = 0
     private var pendingUnderrun = false
     private var senderIdle = true
@@ -44,12 +80,23 @@ final class AudioRingBuffer {
     }
 
     func setTargetMs(_ ms: Double) {
+        guard ms.isFinite else { return }
         os_unfair_lock_lock(lock)
-        let clamped = max(10.0, min(60.0, ms))
-        requestedFrames = Int((clamped / 1000.0) * 48000.0)
-        adaptiveFrames = 0
+        defer { os_unfair_lock_unlock(lock) }
+        let oldTarget = targetFrames
+        let oldRequested = requestedFrames
+        let clamped = min(max(ms, Self.targetRange.lowerBound), Self.targetRange.upperBound)
+        requestedFrames = Int((clamped * 48).rounded())
+        // Increasing the manual target should never take away buffering already added on Wi-Fi.
+        adaptiveFrames = requestedFrames > oldRequested
+            ? max(0, oldRequested + adaptiveFrames - requestedFrames)
+            : 0
         stableTime = 0
-        os_unfair_lock_unlock(lock)
+        if targetFrames > oldTarget && availableFrames < targetFrames {
+            primed = false
+            filteredFillError = 0
+            fractionalOffset = 0
+        }
     }
 
     func reset() {

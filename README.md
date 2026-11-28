@@ -14,7 +14,9 @@ Bản Windows và iOS có ghép đôi phải được cập nhật cùng nhau đ
 
 ## Tinh chỉnh và chẩn đoán
 
-- **Độ trễ thấp** đặt mục tiêu 12 ms. Khi đang nhận, mục **Chất lượng phát** hiển thị mức đệm thực tế sau khi tính số frame mỗi lần iOS yêu cầu. **Ổn định** đặt 30 ms. Nếu LAN bị hụt khi có luồng âm thanh, ứng dụng tăng mức đệm theo bước 5 ms và giảm dần sau khi ổn định.
+- Trong **Âm thanh → Chất lượng phát**, chọn **Độ trễ thấp** (12 ms), **Ổn định** (30 ms) hoặc kéo thanh **Mức đệm mục tiêu** trong khoảng 10–60 ms. Nếu còn gãy tiếng ở 30 ms, thử 40 ms rồi tăng dần. Mức cao hơn có thể làm âm thanh đến chậm hơn. Ứng dụng lưu mức đã chọn và có thể ngắt tiếng trong chốc lát để nạp thêm đệm khi tăng trong lúc phát.
+- Khi đang nhận, **Chất lượng phát** hiển thị mức đệm đang áp dụng, có tính đến số frame mỗi lần iOS yêu cầu. Nếu LAN bị hụt khi có luồng âm thanh, ứng dụng tăng mức đệm theo bước 5 ms và giảm dần sau khi ổn định.
+- Từ mức đệm mục tiêu 30 ms, iPhone chờ tối đa 5 ms khi phát hiện một khoảng trống nhỏ trong thứ tự gói Wi‑Fi. Nếu một đường truyền gặp lỗi trên iPhone, ứng dụng thử mở lại đường đó và vẫn giữ đường còn hoạt động.
 - Mở **Chẩn đoán** trên iPhone để xem mức đệm đang áp dụng, số lần hụt đệm, gói thiếu, gói muộn và thời gian giữa hai gói âm thanh được chấp nhận khi đổi đường truyền. Khoảng cách gói là chỉ số mạng. Độ ngắt nghe được còn phụ thuộc dữ liệu đang có trong bộ đệm.
 - Khi PC đang im tiếng, heartbeat giữ trạng thái kết nối. **Pause streaming** trong khay Windows dừng gửi PCM và giữ heartbeat, và **Resume streaming** mở lại đầu vào WASAPI.
 

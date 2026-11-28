@@ -14,6 +14,7 @@ enum TransportMode: String {
 
 final class AudioReceiver: NSObject, ObservableObject {
     static let port: UInt16 = 55123
+    private static let targetBufferKey = "playbackTargetBufferMs"
 
     @Published var isRunning: Bool = false
     @Published var mode: TransportMode = .waiting
@@ -29,8 +30,14 @@ final class AudioReceiver: NSObject, ObservableObject {
     @Published private(set) var pcIdle = false
     @Published private(set) var needsAudioRecovery = false
     @Published private(set) var usbPairingMessage: String?
-    @Published var targetBufferMs: Double = 20.0 {
-        didSet { ringBuffer.setTargetMs(targetBufferMs) }
+    @Published var targetBufferMs = AudioRingBuffer.defaultTargetMs {
+        didSet {
+            guard targetBufferMs != oldValue else { return }
+            ringBuffer.setTargetMs(targetBufferMs)
+            UserDefaults.standard.set(targetBufferMs, forKey: Self.targetBufferKey)
+            let allowReorder = targetBufferMs >= 30
+            netQueue.async { [weak self] in self?.allowReorder = allowReorder }
+        }
     }
     @Published var statusMessage: String = "Nhấn Bắt đầu để lắng nghe âm thanh từ PC"
 
@@ -47,13 +54,18 @@ final class AudioReceiver: NSObject, ObservableObject {
     private var lanSessions = LANSessionTable()
     private var usbKeyOffer: (token: UUID, key: Data, expiry: TimeInterval)?
 
-    private var udpListener: NWListener?
-    private var tcpListener: NWListener?
+    private enum ListenerTransport: String, CaseIterable {
+        case usb = "USB TCP"
+        case lan = "Wi-Fi UDP"
+    }
+    private var listeners: [ListenerTransport: NWListener] = [:]
+    private var readyListeners: Set<ListenerTransport> = []
+    private var networkListenerSession: UUID?
     private var activeTCPConnections: [NWConnection] = []
     private var activeUDPConnections: [NWConnection] = []
     private weak var authenticatedAudioConnection: NWConnection?
     private var listenerSession: UUID?
-    private var listenerWaitMessages: [String: String] = [:]
+    private var listenerWaitMessages: [ListenerTransport: String] = [:]
     private var listenerStatus: String {
         listenerWaitMessages.values.sorted().first ?? "Đang chờ kết nối USB hoặc Wi-Fi trên cổng \(Self.port)"
     }
@@ -67,10 +79,17 @@ final class AudioReceiver: NSObject, ObservableObject {
     private var droppedCounter: Int = 0
     private var lastSeq: UInt32 = 0
     private var acceptedSequences: UInt64 = 0
+    private var allowReorder = false
+    private var reorder = AudioPacketReorder()
+    private var reorderWork: DispatchWorkItem?
     private var lastTelemetryTime: TimeInterval = 0
     private var hasSeq: Bool = false
 
     override init() {
+        if let saved = UserDefaults.standard.object(forKey: Self.targetBufferKey) as? Double,
+           AudioRingBuffer.targetRange.contains(saved) {
+            _targetBufferMs = Published(initialValue: saved)
+        }
         super.init()
         updateLocalIP()
         updateOutputRoute()
@@ -102,8 +121,7 @@ final class AudioReceiver: NSObject, ObservableObject {
         restartWork?.cancel()
         telemetryTimer?.invalidate()
         engine?.stop()
-        tcpListener?.cancel()
-        udpListener?.cancel()
+        for listener in listeners.values { listener.cancel() }
         for connection in activeTCPConnections { connection.cancel() }
         for connection in activeUDPConnections { connection.cancel() }
         NotificationCenter.default.removeObserver(self)
@@ -120,12 +138,14 @@ final class AudioReceiver: NSObject, ObservableObject {
         audioInterrupted = false
         needsAudioRecovery = false
         let key = try? LANPairing.key()
+        let allowReorder = targetBufferMs >= 30
         ringBuffer.setTargetMs(targetBufferMs)
         ringBuffer.reset()
 
         netQueue.async { [weak self] in
             guard let self = self else { return }
             self.hasSeq = false
+            self.allowReorder = allowReorder
             self.droppedCounter = 0
             self.packetCounter = 0
             self.lastPacketTime = 0
@@ -139,7 +159,13 @@ final class AudioReceiver: NSObject, ObservableObject {
 
         do {
             try setupAudioSessionAndEngine()
-            try startListeners(session: session)
+            netQueue.async { [weak self] in
+                guard let self = self else { return }
+                self.networkListenerSession = session
+                for transport in ListenerTransport.allCases {
+                    self.startListener(for: transport, session: session)
+                }
+            }
             isRunning = true
             droppedPackets = 0
             latePackets = 0
@@ -166,10 +192,10 @@ final class AudioReceiver: NSObject, ObservableObject {
 
         netQueue.async { [weak self] in
             guard let self = self else { return }
-            self.udpListener?.cancel()
-            self.udpListener = nil
-            self.tcpListener?.cancel()
-            self.tcpListener = nil
+            self.networkListenerSession = nil
+            for listener in self.listeners.values { listener.cancel() }
+            self.listeners.removeAll()
+            self.readyListeners.removeAll()
 
             for conn in self.activeTCPConnections { conn.cancel() }
             self.activeTCPConnections.removeAll()
@@ -180,6 +206,8 @@ final class AudioReceiver: NSObject, ObservableObject {
             self.lanKey = nil
             self.packetCounter = 0
             self.hasSeq = false
+            self.clearReorder()
+            self.ringBuffer.reset()
         }
 
         engine?.stop()
@@ -244,8 +272,12 @@ final class AudioReceiver: NSObject, ObservableObject {
     func pairingCode(renew: Bool = false) throws -> String {
         let key = try (renew ? LANPairing.renewKey() : LANPairing.key())
         netQueue.async { [weak self] in
-            self?.lanKey = SymmetricKey(data: key)
-            if renew { self?.lanSessions.clear() }
+            guard let self = self else { return }
+            self.lanKey = SymmetricKey(data: key)
+            if renew {
+                self.lanSessions.clear()
+                self.clearReorder()
+            }
         }
         return key.map { String(format: "%02x", $0) }.joined()
     }
@@ -347,56 +379,76 @@ final class AudioReceiver: NSObject, ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(delay), execute: work)
     }
 
-    private func startListeners(session: UUID) throws {
-        guard let port = NWEndpoint.Port(rawValue: Self.port) else { return }
+    // Listener ownership and retries stay on netQueue.
+    private func startListener(for transport: ListenerTransport, session: UUID, attempts: Int = 0) {
+        guard networkListenerSession == session, listeners[transport] == nil,
+              let port = NWEndpoint.Port(rawValue: Self.port) else { return }
 
-        let tcpOptions = NWProtocolTCP.Options()
-        tcpOptions.noDelay = true
-        let tcpParams = NWParameters(tls: nil, tcp: tcpOptions)
-        // The phone-side usbmux service connects to the device loopback interface.
-        tcpParams.requiredInterfaceType = .loopback
-        tcpParams.allowLocalEndpointReuse = true
-        let tcp = try NWListener(using: tcpParams, on: port)
-        tcp.stateUpdateHandler = listenerStateHandler(for: "USB TCP", session: session)
-        tcp.newConnectionHandler = { [weak self] conn in
-            self?.handleTCPConnection(conn)
+        let parameters: NWParameters
+        switch transport {
+        case .usb:
+            let tcp = NWProtocolTCP.Options()
+            tcp.noDelay = true
+            parameters = NWParameters(tls: nil, tcp: tcp)
+            // usbmux connects to the phone's loopback interface.
+            parameters.requiredInterfaceType = .loopback
+        case .lan:
+            parameters = .udp
+            parameters.serviceClass = .interactiveVoice
         }
+        parameters.allowLocalEndpointReuse = true
 
-        let udpParams = NWParameters.udp
-        udpParams.allowLocalEndpointReuse = true
-        udpParams.serviceClass = .interactiveVoice
-        let udp = try NWListener(using: udpParams, on: port)
-        udp.stateUpdateHandler = listenerStateHandler(for: "Wi-Fi UDP", session: session)
-        udp.newConnectionHandler = { [weak self] conn in
-            self?.handleUDPConnection(conn)
-        }
-
-        netQueue.async { [weak self] in
-            guard let self = self else { return }
-            self.tcpListener = tcp
-            self.udpListener = udp
-            tcp.start(queue: self.netQueue)
-            udp.start(queue: self.netQueue)
-        }
-    }
-
-    private func listenerStateHandler(for transport: String, session: UUID) -> (NWListener.State) -> Void {
-        return { [weak self] state in
-            DispatchQueue.main.async { [weak self] in
-                guard let self = self, self.listenerSession == session else { return }
+        do {
+            let listener = try NWListener(using: parameters, on: port)
+            listeners[transport] = listener
+            listener.newConnectionHandler = { [weak self, weak listener] connection in
+                guard let self = self, let listener = listener, self.listeners[transport] === listener else {
+                    connection.cancel()
+                    return
+                }
+                switch transport {
+                case .usb: self.handleTCPConnection(connection)
+                case .lan: self.handleUDPConnection(connection)
+                }
+            }
+            listener.stateUpdateHandler = { [weak self, weak listener] state in
+                guard let self = self, let listener = listener, self.listeners[transport] === listener else { return }
                 switch state {
-                case let .failed(error):
-                    self.stop(message: "Lỗi mở cổng \(Self.port) (\(transport)): \(error.localizedDescription)")
-                case let .waiting(error):
-                    self.listenerWaitMessages[transport] = "Đang chờ mở cổng \(Self.port) (\(transport)): \(error.localizedDescription)"
-                    self.statusMessage = self.listenerStatus
                 case .ready:
-                    self.listenerWaitMessages.removeValue(forKey: transport)
-                    self.statusMessage = self.listenerStatus
+                    self.readyListeners.insert(transport)
+                    self.reportListener(transport, session: session, message: nil)
+                case let .waiting(error):
+                    self.reportListener(transport, session: session,
+                                        message: "Đang chờ mở cổng \(Self.port) (\(transport.rawValue)): \(error.localizedDescription)")
+                case let .failed(error):
+                    self.listeners.removeValue(forKey: transport)
+                    listener.cancel()
+                    let attempt = self.readyListeners.remove(transport) == nil ? attempts : 0
+                    self.retryListener(transport, session: session, attempts: attempt, error: error)
                 default:
                     break
                 }
             }
+            listener.start(queue: netQueue)
+        } catch {
+            retryListener(transport, session: session, attempts: attempts, error: error)
+        }
+    }
+
+    private func retryListener(_ transport: ListenerTransport, session: UUID, attempts: Int, error: Error) {
+        reportListener(transport, session: session,
+                       message: "Lỗi mở cổng \(Self.port) (\(transport.rawValue)), đang thử lại: \(error.localizedDescription)")
+        let delay = 1 << min(attempts, 3)
+        netQueue.asyncAfter(deadline: .now() + .seconds(delay)) { [weak self] in
+            self?.startListener(for: transport, session: session, attempts: min(attempts + 1, 3))
+        }
+    }
+
+    private func reportListener(_ transport: ListenerTransport, session: UUID, message: String?) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self, self.listenerSession == session else { return }
+            self.listenerWaitMessages[transport] = message
+            self.statusMessage = self.listenerStatus
         }
     }
 
@@ -422,7 +474,7 @@ final class AudioReceiver: NSObject, ObservableObject {
 
     private func receiveTCPChunk(conn: NWConnection, stream: TCPStream) {
         conn.receive(minimumIncompleteLength: 1, maximumLength: 16384) { [weak self] data, _, isComplete, error in
-            guard let self = self else { return }
+            guard let self = self, self.activeTCPConnections.contains(where: { $0 === conn }) else { return }
             if let data = data, !data.isEmpty {
                 stream.buffer.append(data)
                 if !stream.identifiedAsAudio {
@@ -499,7 +551,7 @@ final class AudioReceiver: NSObject, ObservableObject {
 
     private func receiveUDPMessage(conn: NWConnection) {
         conn.receiveMessage { [weak self] data, _, _, error in
-            guard let self = self else { return }
+            guard let self = self, self.activeUDPConnections.contains(where: { $0 === conn }) else { return }
             if let data = data { self.handleLANDatagram(data, connection: conn) }
             if error == nil {
                 self.receiveUDPMessage(conn: conn)
@@ -579,6 +631,47 @@ final class AudioReceiver: NSObject, ObservableObject {
             }
             return
         }
+        let packet = AudioPacketReorder.Packet(seq: seq, payload: payload, isUSB: isUSB, captureResumed: captureResumed)
+        let delta = Int32(bitPattern: seq &- lastSeq)
+        let continuing = hasSeq && now - lastPacketTime <= 1
+        if continuing && allowReorder && !isUSB && !captureResumed && reorder.hold(packet, after: lastSeq) {
+            if reorderWork == nil {
+                let work = DispatchWorkItem { [weak self] in
+                    self?.drainReorder(flush: true, now: ProcessInfo.processInfo.systemUptime)
+                }
+                reorderWork = work
+                netQueue.asyncAfter(deadline: .now() + .milliseconds(AudioPacketReorder.waitMs), execute: work)
+            }
+            return
+        }
+        if !continuing {
+            clearReorder()
+        } else if delta > 1 && !reorder.isEmpty {
+            drainReorder(flush: true, now: now, before: seq)
+        }
+        commitAudio(packet, now: now)
+        if !reorder.isEmpty { drainReorder(flush: false, now: now) }
+    }
+
+    private func drainReorder(flush: Bool, now: TimeInterval, before seq: UInt32? = nil) {
+        while let packet = reorder.next(after: lastSeq, flush: flush, before: seq) {
+            commitAudio(packet, now: now)
+        }
+        if reorder.isEmpty {
+            reorderWork?.cancel()
+            reorderWork = nil
+        }
+    }
+
+    private func clearReorder() {
+        reorderWork?.cancel()
+        reorderWork = nil
+        reorder = AudioPacketReorder()
+    }
+
+    private func commitAudio(_ packet: AudioPacketReorder.Packet, now: TimeInterval) {
+        let seq = packet.seq
+        let isUSB = packet.isUSB
         let gap = now - lastPacketTime
         if hasSeq && gap <= 1 {
             let delta = Int32(bitPattern: seq &- lastSeq)
@@ -588,10 +681,10 @@ final class AudioReceiver: NSObject, ObservableObject {
             }
             acceptedSequences = delta < 64 ? (acceptedSequences << delta) | 1 : 1
             if delta < 1000 { droppedCounter += Int(delta - 1) }
-            if isUSB != lastTransportIsUSB { handoffMs = gap * 1000 }
         } else {
             acceptedSequences = 1
         }
+        if hasSeq && isUSB != lastTransportIsUSB { handoffMs = gap * 1000 }
 
         hasSeq = true
         lastSeq = seq
@@ -600,7 +693,7 @@ final class AudioReceiver: NSObject, ObservableObject {
         lastContactTime = now
         lastContactIsUSB = isUSB
         packetCounter += 1
-        ringBuffer.pushPCM16(payload, isUSB: isUSB, captureResumed: captureResumed)
+        ringBuffer.pushPCM16(packet.payload, isUSB: isUSB, captureResumed: packet.captureResumed)
     }
 
     private func startTelemetry() {

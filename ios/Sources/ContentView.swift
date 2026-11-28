@@ -7,6 +7,7 @@ struct ContentView: View {
     @StateObject private var receiver = AudioReceiver()
     @State private var showPairing = false
     @State private var showDiagnostics = false
+    @State private var pendingBufferMs: Double?
     @State private var confirmKeyRenewal = false
     @State private var confirmUSBPairing = false
     @State private var pairingKey = ""
@@ -137,6 +138,22 @@ struct ContentView: View {
                     preset("Ổn định", symbol: "shield", milliseconds: 30)
                 }
             }
+            metric("Mức đệm mục tiêu", "\(Int(pendingBufferMs ?? receiver.targetBufferMs)) ms")
+                .accessibilityHidden(true)
+            Slider(value: bufferSlider, in: AudioRingBuffer.targetRange, step: 1, onEditingChanged: { editing in
+                if editing {
+                    pendingBufferMs = receiver.targetBufferMs
+                } else if let value = pendingBufferMs {
+                    receiver.targetBufferMs = value
+                    pendingBufferMs = nil
+                }
+            })
+            .tint(GlassTheme.mint)
+            .accessibilityLabel("Mức đệm mục tiêu")
+            .accessibilityValue("\(Int(pendingBufferMs ?? receiver.targetBufferMs)) mili giây")
+            Text("Nếu tiếng bị gãy, hãy tăng dần mức đệm. Mức cao hơn có thể làm âm thanh đến chậm hơn.")
+                .font(AppFont.regular(13, relativeTo: .footnote))
+                .foregroundStyle(.secondary)
             if receiver.isRunning && receiver.effectiveTargetMs > 0 {
                 Text("Mức đệm đang áp dụng: \(milliseconds(receiver.effectiveTargetMs))")
                     .font(AppFont.regular(13, relativeTo: .footnote))
@@ -145,6 +162,19 @@ struct ContentView: View {
         }
         .padding(18)
         .glassPanel(radius: 24)
+    }
+
+    private var bufferSlider: Binding<Double> {
+        Binding(
+            get: { pendingBufferMs ?? receiver.targetBufferMs },
+            set: { value in
+                if pendingBufferMs != nil {
+                    pendingBufferMs = value
+                } else {
+                    receiver.targetBufferMs = value
+                }
+            }
+        )
     }
 
     private func preset(_ title: String, symbol: String, milliseconds: Double) -> some View {
@@ -181,11 +211,6 @@ struct ContentView: View {
                 metric("Gói thiếu lúc phát", "\(receiver.droppedPackets)")
                 metric("Gói đến muộn", "\(receiver.latePackets)")
                 metric("Khoảng cách gói khi chuyển", receiver.lastHandoffMs.map(milliseconds) ?? "–")
-                Divider()
-                metric("Mức đệm tùy chỉnh", "\(Int(receiver.targetBufferMs)) ms")
-                Slider(value: $receiver.targetBufferMs, in: 10...60, step: 1)
-                    .accessibilityLabel("Mức đệm tùy chỉnh")
-                    .accessibilityValue("\(Int(receiver.targetBufferMs)) mili giây")
             }
             .padding(.top, 16)
         } label: {

@@ -8,6 +8,7 @@ struct LANSession {
     let key: SymmetricKey
     var lastAudioSeq: UInt32?
     var lastHeartbeatSeq: UInt32?
+    var recentAudio: UInt8 = 0
 
     func decrypt(_ packet: Data, prefixSize: Int, payloadLength: Int, flags: UInt16) -> Data? {
         var iv = Data(count: 12)
@@ -26,9 +27,25 @@ struct LANSession {
     }
 
     mutating func accept(seq: UInt32, heartbeat: Bool) -> Bool {
-        let last = heartbeat ? lastHeartbeatSeq : lastAudioSeq
-        if let last = last, Int32(bitPattern: seq &- last) <= 0 { return false }
-        if heartbeat { lastHeartbeatSeq = seq } else { lastAudioSeq = seq }
+        if heartbeat {
+            if let last = lastHeartbeatSeq, Int32(bitPattern: seq &- last) <= 0 { return false }
+            lastHeartbeatSeq = seq
+            return true
+        }
+        if let last = lastAudioSeq {
+            let delta = Int32(bitPattern: seq &- last)
+            if delta <= 0 {
+                // Accept a missing audio packet once, within the playback reorder window.
+                guard delta >= -AudioPacketReorder.maxAhead else { return false }
+                let bit: UInt8 = 1 << -delta
+                guard recentAudio & bit == 0 else { return false }
+                recentAudio |= bit
+                return true
+            }
+            recentAudio <<= min(delta, 8)
+        }
+        lastAudioSeq = seq
+        recentAudio |= 1
         return true
     }
 }

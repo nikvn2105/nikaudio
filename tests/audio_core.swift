@@ -56,6 +56,34 @@ struct AudioCoreTests {
               "Unmarked network stall was not counted")
     }
 
+    static func testRaisedBufferTargetDuringPlayback() {
+        let ring = AudioRingBuffer()
+        let output = UnsafeMutablePointer<Float>.allocate(capacity: 240)
+        defer { output.deallocate() }
+        for _ in 0..<12 { ring.pushPCM16(packet, isUSB: false) }
+        ring.pull(left: output, right: nil, frameCount: 240)
+
+        let bufferedMs = ring.diagnostics().bufferMs
+        ring.setTargetMs(55)
+        ring.pull(left: output, right: nil, frameCount: 240)
+        let waiting = ring.diagnostics()
+        check(waiting.targetMs == 55 && waiting.bufferMs == bufferedMs,
+              "Raising the target did not hold buffered audio to refill")
+
+        for _ in 0..<14 { ring.pushPCM16(packet, isUSB: false) }
+        let refilled = ring.diagnostics().bufferMs
+        ring.pull(left: output, right: nil, frameCount: 240)
+        let resumed = ring.diagnostics()
+        check(resumed.bufferMs < refilled && resumed.underruns == 0,
+              "Playback did not resume cleanly after refilling")
+
+        for _ in 0..<20 { ring.pull(left: output, right: nil, frameCount: 240) }
+        ring.pushPCM16(packet, isUSB: false)
+        check(ring.diagnostics().targetMs == 60, "Wi-Fi underrun did not raise the manual target")
+        ring.setTargetMs(56)
+        check(ring.diagnostics().targetMs == 60, "Raising the manual target reduced the existing buffer boost")
+    }
+
     static func testAuthenticatedResumeMarker() {
         let key = SymmetricKey(data: Data(repeating: 3, count: 32))
         let session = LANSession(challenge: Data(), nonce: Data(), expiresAt: 25,
@@ -73,6 +101,40 @@ struct AudioCoreTests {
         check(session.decrypt(header + sealed.ciphertext + sealed.tag, prefixSize: 28,
                               payloadLength: packet.count, flags: 0) == nil,
               "Resume marker was not authenticated")
+    }
+
+    static func testReorderedAudio() {
+        var reorder = AudioPacketReorder()
+        func audio(_ seq: UInt32) -> AudioPacketReorder.Packet {
+            .init(seq: seq, payload: packet, isUSB: false, captureResumed: false)
+        }
+        check(reorder.hold(audio(102), after: 100), "Could not hold an early packet")
+        check(reorder.hold(audio(102), after: 100), "Duplicate escaped the reorder queue")
+        check(reorder.next(after: 100, flush: false) == nil, "Queue skipped a packet before the deadline")
+        check(reorder.next(after: 101, flush: false)?.seq == 102 && reorder.isEmpty,
+              "Queue did not release exactly one packet after the missing packet arrived")
+        check(reorder.hold(audio(103), after: 100) && reorder.next(after: 100, flush: true, before: 102) == nil,
+              "A newer queued packet would skip the current packet during handoff")
+        check(reorder.next(after: 102, flush: false)?.seq == 103 && reorder.isEmpty,
+              "Queue did not resume after a handoff packet")
+        check(!reorder.hold(audio(105), after: 100), "Queue accepted a packet outside the window")
+        check(reorder.hold(audio(1), after: .max) && reorder.hold(audio(2), after: .max),
+              "Queue did not handle sequence wrapping")
+        check(reorder.next(after: .max, flush: true)?.seq == 1 &&
+              reorder.next(after: 1, flush: false)?.seq == 2 && reorder.isEmpty,
+              "Deadline did not release held packets in sequence order")
+
+        let key = SymmetricKey(data: Data(repeating: 3, count: 32))
+        var session = LANSession(challenge: Data(), nonce: Data(), expiresAt: 25,
+                                 key: key, lastAudioSeq: nil, lastHeartbeatSeq: nil)
+        check(session.accept(seq: .max - 1, heartbeat: false) && session.accept(seq: 0, heartbeat: false),
+              "Audio sequence did not wrap")
+        check(session.accept(seq: .max, heartbeat: false) && !session.accept(seq: .max, heartbeat: false),
+              "Missing audio must be accepted once")
+        check(!session.accept(seq: .max - 1, heartbeat: false) && !session.accept(seq: .max - 3, heartbeat: false),
+              "Audio sequence accepted a duplicate or a packet outside the window")
+        check(session.accept(seq: 7, heartbeat: true) && !session.accept(seq: 6, heartbeat: true),
+              "Heartbeat must reject older sequences")
     }
 
     static func testSessions() {
@@ -118,7 +180,9 @@ struct AudioCoreTests {
     static func main() {
         testUnderruns()
         testShortCapturePauses()
+        testRaisedBufferTargetDuringPlayback()
         testAuthenticatedResumeMarker()
+        testReorderedAudio()
         testSessions()
         testDrift(ppm: -200)
         testDrift(ppm: 200)
